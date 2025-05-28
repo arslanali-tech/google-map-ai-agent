@@ -360,11 +360,12 @@ def normalize_url(url):
     return url
 
 def create_business_hash(name, address, phone):
-    """Create a unique hash for a business to detect duplicates"""
+    """Create a unique hash for a business to detect duplicates, with improved address normalization"""
     name_norm = clean_field(name).lower().strip()
-    address_norm = clean_field(address).lower().strip()
+    # Use only the first part of the address (before the first comma)
+    address_main = address.split(',')[0] if address else ''
+    address_norm = clean_field(address_main).lower().strip()
     phone_norm = re.sub(r'[^\d]', '', clean_field(phone))
-    
     unique_string = f"{name_norm}|{address_norm}|{phone_norm}"
     return hashlib.md5(unique_string.encode()).hexdigest()
 
@@ -1011,7 +1012,7 @@ def export_to_excel(data, filename):
                 if col == 'Website':
                     df[col] = df[col].apply(lambda x: normalize_url(x))
         
-        # Create a composite key for duplicate detection
+        # Create a composite key for duplicate detection (improved address normalization)
         df['composite_key'] = df.apply(lambda row: create_business_hash(
             row['Business Name'], 
             row['Address'], 
