@@ -978,7 +978,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
     return data[:max_cards]
 
 def export_to_excel(data, filename):
-    """Enhanced Excel export with better formatting"""
+    """Enhanced Excel export with better formatting and duplicate prevention"""
     try:
         df = pd.DataFrame(data)
         
@@ -992,6 +992,39 @@ def export_to_excel(data, filename):
         # Only include columns that exist in the data
         existing_columns = [col for col in column_order if col in df.columns]
         df = df[existing_columns]
+        
+        # Clean and normalize data to prevent duplicates
+        for col in df.columns:
+            if col in ['Business Name', 'Address', 'Phone Number', 'Email', 'Website']:
+                # Convert to string and clean
+                df[col] = df[col].astype(str).apply(lambda x: clean_field(x))
+                
+                # Normalize phone numbers
+                if col == 'Phone Number':
+                    df[col] = df[col].apply(lambda x: re.sub(r'[^\d+]', '', x))
+                
+                # Normalize emails
+                if col == 'Email':
+                    df[col] = df[col].apply(lambda x: x.lower().strip())
+                
+                # Normalize websites
+                if col == 'Website':
+                    df[col] = df[col].apply(lambda x: normalize_url(x))
+        
+        # Create a composite key for duplicate detection
+        df['composite_key'] = df.apply(lambda row: create_business_hash(
+            row['Business Name'], 
+            row['Address'], 
+            row['Phone Number']
+        ), axis=1)
+        
+        # Remove duplicates based on composite key
+        initial_count = len(df)
+        df = df.drop_duplicates(subset=['composite_key'], keep='first')
+        removed_count = initial_count - len(df)
+        
+        # Remove the composite key column
+        df = df.drop('composite_key', axis=1)
         
         # Export to Excel
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
@@ -1018,7 +1051,8 @@ def export_to_excel(data, filename):
         
         # Print summary statistics
         print(f'\n=== EXTRACTION SUMMARY ===')
-        print(f'Total businesses: {len(df)}')
+        print(f'Total unique businesses: {len(df)}')
+        print(f'Duplicates removed: {removed_count}')
         print(f'Businesses with emails: {len(df[df["Email"] != ""])}')
         print(f'Businesses with websites: {len(df[df["Website"] != ""])}')
         
