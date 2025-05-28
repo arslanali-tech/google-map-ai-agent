@@ -19,7 +19,7 @@ from typing import Dict, List, Set, Optional, Tuple
 
 # Load environment variables
 load_dotenv()
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_API_KEY = 'AIzaSyCC7Cd4yONA6BErnEFMtXxhqiEdARcXxcs'
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables.")
 
@@ -27,6 +27,7 @@ OUTPUT_FILE = 'google_maps_businesses.xlsx'
 SEARCH_URL = 'https://www.google.com/maps'
 GEMINI_MODEL = 'models/gemini-2.0-flash'
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+MAX_BUSINESSES = 500  # Increased maximum number of businesses
 
 class RobustSocialExtractor:
     """Enhanced social media and email extraction class"""
@@ -397,24 +398,52 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
             
-            await page.goto(url, timeout=25000, wait_until='domcontentloaded')
+            # Set longer timeout and wait for network idle
+            await page.goto(url, timeout=30000, wait_until='networkidle')
             await asyncio.sleep(3)  # Allow dynamic content to load
             
-            # Get all text content
-            all_text = await page.evaluate('document.body.innerText || document.body.textContent || ""')
+            # Get all text content including meta tags and link tags
+            all_text = await page.evaluate('''
+                () => {
+                    // Get all text content
+                    const getText = (el) => {
+                        if (!el) return '';
+                        return Array.from(el.childNodes)
+                            .map(node => {
+                                if (node.nodeType === 3) return node.textContent;
+                                if (node.nodeType === 1) {
+                                    const style = window.getComputedStyle(node);
+                                    if (style.display === 'none' || style.visibility === 'hidden') return '';
+                                    return getText(node);
+                                }
+                                return '';
+                            })
+                            .join(' ')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                    };
+                    
+                    // Get all meta tags content
+                    const metaContent = Array.from(document.getElementsByTagName('meta'))
+                        .map(meta => meta.content)
+                        .join(' ');
+                    
+                    // Get all link tags content
+                    const linkContent = Array.from(document.getElementsByTagName('link'))
+                        .map(link => link.href)
+                        .join(' ');
+                    
+                    return getText(document.body) + ' ' + metaContent + ' ' + linkContent;
+                }
+            ''')
             
-            # Get HTML content for link extraction
-            html_content = await page.content()
-            
-            # Extract social media links using enhanced extractor
-            social_data = RobustSocialExtractor.extract_social_from_text(all_text)
-            
-            # Also extract from HTML links
+            # Enhanced link extraction from HTML
             links = await page.evaluate('''
                 () => {
-                    const anchors = document.querySelectorAll('a[href]');
                     const links = new Set();
                     
+                    // Get all links
+                    const anchors = document.querySelectorAll('a[href]');
                     anchors.forEach(anchor => {
                         let href = anchor.href;
                         if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
@@ -427,9 +456,46 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                         }
                     });
                     
+                    // Get all meta tags with social media URLs
+                    const metaTags = document.querySelectorAll('meta[property^="og:"], meta[property^="twitter:"], meta[name^="twitter:"]');
+                    metaTags.forEach(meta => {
+                        const content = meta.getAttribute('content');
+                        if (content && content.startsWith('http')) {
+                            links.add(content);
+                        }
+                    });
+                    
+                    // Get all link tags with social media URLs
+                    const linkTags = document.querySelectorAll('link[rel="canonical"], link[rel="alternate"]');
+                    linkTags.forEach(link => {
+                        const href = link.getAttribute('href');
+                        if (href && href.startsWith('http')) {
+                            links.add(href);
+                        }
+                    });
+                    
+                    // Get all script tags that might contain social media URLs
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    scripts.forEach(script => {
+                        try {
+                            const data = JSON.parse(script.textContent);
+                            if (data.sameAs) {
+                                data.sameAs.forEach(url => links.add(url));
+                            }
+                            if (data.url) {
+                                links.add(data.url);
+                            }
+                        } catch (e) {
+                            // Skip invalid JSON
+                        }
+                    });
+                    
                     return Array.from(links);
                 }
             ''')
+            
+            # Extract social media links using enhanced extractor
+            social_data = RobustSocialExtractor.extract_social_from_text(all_text)
             
             # Enhance social data with found links
             for link in links:
@@ -440,6 +506,38 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                                 if RobustSocialExtractor._is_valid_social_url(link, platform):
                                     social_data[platform] = link
                                     break
+            
+            # Additional social media extraction from meta tags
+            meta_social = await page.evaluate('''
+                () => {
+                    const socialData = {};
+                    const metaTags = document.querySelectorAll('meta[property^="og:"], meta[property^="twitter:"], meta[name^="twitter:"]');
+                    
+                    metaTags.forEach(meta => {
+                        const property = meta.getAttribute('property') || meta.getAttribute('name');
+                        const content = meta.getAttribute('content');
+                        
+                        if (property && content) {
+                            if (property.includes('facebook')) {
+                                socialData.facebook = content;
+                            } else if (property.includes('twitter')) {
+                                socialData.twitter = content;
+                            } else if (property.includes('instagram')) {
+                                socialData.instagram = content;
+                            } else if (property.includes('linkedin')) {
+                                socialData.linkedin = content;
+                            }
+                        }
+                    });
+                    
+                    return socialData;
+                }
+            ''')
+            
+            # Merge meta social data
+            for platform, link in meta_social.items():
+                if link and not social_data.get(platform.capitalize()):
+                    social_data[platform.capitalize()] = link
             
             # Extract emails using enhanced method
             emails = RobustSocialExtractor.extract_emails_from_text(all_text)
@@ -502,10 +600,12 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
 
         last_count = 0
         no_new_cards_scrolls = 0
-        max_no_new_cards_scrolls = 8
+        max_no_new_cards_scrolls = 25  # Increased to allow more scrolling attempts
+        consecutive_same_count = 0
+        max_consecutive_same_count = 8  # Increased to be more persistent
         print(f'Scrolling to load cards (target: {max_cards})...')
         
-        # Scroll to load cards
+        # Enhanced auto-scrolling with better performance
         while True:
             if controller.stop_all_requested:
                 print('All stopped by user during scrolling.')
@@ -515,60 +615,219 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 break
                 
             cards = await page.query_selector_all(results_selector)
-            print(f'Cards loaded: {len(cards)} (target: {max_cards})')
+            current_count = len(cards)
+            print(f'Cards loaded: {current_count} (target: {max_cards})')
             
-            if len(cards) >= max_cards * 1.5:
-                print(f'Loaded sufficient cards: {len(cards)}')
+            # Continue scrolling until we have at least max_cards * 1.5 (to account for duplicates and failures)
+            if current_count >= max_cards * 1.5:
+                print(f'Loaded sufficient cards: {current_count}')
                 break
                 
-            if len(cards) == last_count:
+            if current_count == last_count:
                 no_new_cards_scrolls += 1
+                consecutive_same_count += 1
+                
+                # If we get the same count multiple times, try a more aggressive scroll
+                if consecutive_same_count >= 2:
+                    print(f"Same count {consecutive_same_count} times in a row. Trying aggressive scroll...")
+                    try:
+                        # More aggressive scrolling with multiple techniques
+                        for _ in range(8):  # Increased from 5 to 8
+                            # Use multiple scrolling methods simultaneously
+                            await page.evaluate('''
+                                () => {
+                                    // Scroll the main container
+                                    const mainContainer = document.querySelector('div[role="main"] div[aria-label][tabindex="0"]');
+                                    if (mainContainer) {
+                                        mainContainer.scrollBy(0, 3000);
+                                    }
+                                    
+                                    // Scroll the window
+                                    window.scrollBy(0, 2000);
+                                    
+                                    // Force scroll event
+                                    const scrollEvent = new Event('scroll', { bubbles: true });
+                                    if (mainContainer) mainContainer.dispatchEvent(scrollEvent);
+                                    window.dispatchEvent(scrollEvent);
+                                }
+                            ''')
+                            
+                            # Use keyboard and mouse wheel
+                            await page.keyboard.press('End')
+                            await page.mouse.wheel(0, 3000)
+                            await asyncio.sleep(0.3)
+                            
+                            # Try clicking "Show more results" if available
+                            try:
+                                show_more = await page.query_selector('button[jsaction*="pane.showMoreResults"]')
+                                if show_more:
+                                    await show_more.click()
+                                    await asyncio.sleep(1)
+                            except:
+                                pass
+                            
+                            await asyncio.sleep(0.3)
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        print(f"Aggressive scroll failed: {e}")
+                
+                if no_new_cards_scrolls >= max_no_new_cards_scrolls:
+                    print(f'No more new cards found after {max_no_new_cards_scrolls} attempts. Total: {current_count}')
+                    break
             else:
                 no_new_cards_scrolls = 0
-            last_count = len(cards)
+                consecutive_same_count = 0
+                
+            last_count = current_count
             
-            if no_new_cards_scrolls >= max_no_new_cards_scrolls:
-                print(f'No more new cards found. Total: {len(cards)}')
-                break
-            
-            # Scroll actions
+            # Enhanced auto-scrolling with multiple techniques
             try:
-                await scrollable.focus()
-                await page.evaluate(f"let el = document.querySelector('{scrollable_selector}'); if(el) el.scrollTo(0, el.scrollHeight);")
-                await page.mouse.wheel(0, 8000)
-                for _ in range(6):
+                # Improved scrolling mechanism with multiple methods
+                await page.evaluate('''
+                    (selector) => {
+                        const scrollable = document.querySelector(selector);
+                        if (scrollable) {
+                            // Calculate scroll amount based on container height
+                            const scrollAmount = Math.max(2500, scrollable.scrollHeight * 0.8);
+                            
+                            // Smooth scroll with easing
+                            const start = scrollable.scrollTop;
+                            const end = start + scrollAmount;
+                            const duration = 1000;
+                            const startTime = performance.now();
+                            
+                            function easeInOutQuad(t) {
+                                return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+                            }
+                            
+                            function scroll() {
+                                const now = performance.now();
+                                const elapsed = now - startTime;
+                                const progress = Math.min(elapsed / duration, 1);
+                                const eased = easeInOutQuad(progress);
+                                
+                                scrollable.scrollTop = start + (end - start) * eased;
+                                
+                                if (progress < 1) {
+                                    requestAnimationFrame(scroll);
+                                }
+                            }
+                            
+                            scroll();
+                            
+                            // Force scroll event
+                            const scrollEvent = new Event('scroll', { bubbles: true });
+                            scrollable.dispatchEvent(scrollEvent);
+                        }
+                    }
+                ''', scrollable_selector)
+                
+                # Additional scrolling methods
+                for _ in range(10):  # Increased from 8 to 10
                     if controller.stop_all_requested or controller.stop_scrolling_requested:
                         break
+                        
+                    # Use multiple scrolling techniques
                     await page.keyboard.press('PageDown')
-                    await asyncio.sleep(0.3)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
+                    await page.mouse.wheel(0, 1000)
+                    
+                    # Try to find and click "Show more results" button
+                    try:
+                        show_more = await page.query_selector('button[jsaction*="pane.showMoreResults"]')
+                        if show_more:
+                            await show_more.click()
+                            await asyncio.sleep(1)
+                    except:
+                        pass
+                    
+                    await asyncio.sleep(0.2)
+                
+                # Wait for potential new content to load
+                await asyncio.sleep(1.5)
+                
+            except Exception as e:
+                print(f'Scrolling error: {e}')
+                # Try alternative scrolling methods if the first one fails
+                try:
+                    # Try multiple alternative scrolling methods
+                    await page.evaluate('''
+                        () => {
+                            // Try scrolling the main container
+                            const mainContainer = document.querySelector('div[role="main"] div[aria-label][tabindex="0"]');
+                            if (mainContainer) {
+                                mainContainer.scrollBy(0, 2000);
+                            }
+                            
+                            // Try scrolling the window
+                            window.scrollBy(0, 1500);
+                            
+                            // Try clicking "Show more results" if available
+                            const showMore = document.querySelector('button[jsaction*="pane.showMoreResults"]');
+                            if (showMore) showMore.click();
+                        }
+                    ''')
+                    await asyncio.sleep(1)
+                except Exception as e2:
+                    print(f'Alternative scrolling also failed: {e2}')
+                continue
+                
+            await asyncio.sleep(1.5)
         
-        # Enhanced extraction loop
+        # Enhanced extraction loop with better social media detection
         cards = await page.query_selector_all(results_selector)
-        print(f'Starting enhanced extraction from {len(cards)} cards...')
+        total_cards = len(cards)
+        print(f'Starting enhanced extraction from {total_cards} cards...')
         
         processed_count = 0
-        for idx in range(len(cards)):
+        remaining_businesses = max_cards
+        max_processing_attempts = min(total_cards, max_cards * 3)  # Increased from 2 to 3 to ensure we get enough unique businesses
+        
+        # Continue processing cards until we've extracted exactly max_cards unique businesses
+        # or until we've processed all available cards
+        for idx in range(min(total_cards, max_processing_attempts)):
             if controller.stop_all_requested:
                 print('All stopped by user during extraction.')
                 break
             if len(data) >= max_cards:
-                print(f'Reached target of {max_cards} unique businesses.')
+                print(f'Reached target of exactly {max_cards} unique businesses.')
                 break
+                
+            # Check if we're unlikely to find enough businesses
+            remaining_cards = total_cards - idx
+            if len(data) + remaining_cards * 0.5 < max_cards:  # Reduced from 0.7 to 0.5 to be more conservative
+                print(f"Warning: May not find enough unique businesses. Currently have {len(data)}, need {max_cards}, with {remaining_cards} cards left to process.")
                 
             card = cards[idx]
             processed_count += 1
             
             try:
-                print(f'Processing business {processed_count}/{len(cards)} (Unique found: {len(data)}/{max_cards})...')
+                print(f'Processing business {processed_count}/{total_cards} (Unique found: {len(data)}/{max_cards}, Remaining: {max_cards - len(data)})...')
                 await card.click()
                 await page.wait_for_selector('h1, .fontHeadlineLarge, .DUwDvf', timeout=8000)
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)  # Increased from 1 to 1.5
                 
-                # Get all text for analysis
-                all_text = await page.evaluate('document.body.innerText')
+                # Enhanced text extraction for better social media detection
+                all_text = await page.evaluate('''
+                    () => {
+                        const getText = (el) => {
+                            if (!el) return '';
+                            return Array.from(el.childNodes)
+                                .map(node => {
+                                    if (node.nodeType === 3) return node.textContent;
+                                    if (node.nodeType === 1) {
+                                        const style = window.getComputedStyle(node);
+                                        if (style.display === 'none' || style.visibility === 'hidden') return '';
+                                        return getText(node);
+                                    }
+                                    return '';
+                                })
+                                .join(' ')
+                                .replace(/\\s+/g, ' ')
+                                .trim();
+                        };
+                        return getText(document.body);
+                    }
+                ''')
                 
                 # Try Gemini extraction first
                 gemini_data = await extract_with_gemini(all_text)
@@ -581,7 +840,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                     email = gemini_data.get('Email', '')
                     website = gemini_data.get('Website', '')
                 else:
-                    # Fallback to manual extraction
+                    # Enhanced manual extraction
                     name = await safe_text(page, 'h1, .fontHeadlineLarge, .DUwDvf, [data-item-id="title"]')
                     business_type = await safe_text(page, '.fontBodyMedium button[jsaction*="pane.rating.category"], .skqShb')
                     address = await safe_text(page, '[data-item-id="address"], .rogA2c, .Io6YTe.fontBodyMedium, .LrzXr')
@@ -591,7 +850,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                         phone_matches = re.findall(r'(\+?\d[\d\s\-().]{8,}\d)', all_text)
                         phone = phone_matches[0] if phone_matches else ''
                     
-                    # Extract website
+                    # Enhanced website extraction
                     website = ''
                     website_elements = await page.query_selector_all('a[data-item-id="authority"], a[aria-label*="Website"], .rogA2c a, .Io6YTe a')
                     for element in website_elements:
@@ -605,7 +864,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                         if domain_match:
                             website = domain_match.group(0)
                     
-                    # Extract email
+                    # Enhanced email extraction
                     email = ''
                     email_link = await page.query_selector('a[href^="mailto:"]')
                     if email_link:
@@ -625,14 +884,10 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 
                 # Check for duplicates
                 business_hash = create_business_hash(name, address, phone)
-                if business_hash in unique_hashes:
-                    print(f'Skipping duplicate: {name}')
+                if business_hash in unique_hashes or not name.strip():
+                    print(f'Skipping duplicate or invalid business: {name}')
                     continue
                 unique_hashes.add(business_hash)
-                
-                if not name.strip():
-                    print(f'Skipping business with empty name')
-                    continue
                 
                 # Normalize website URL
                 if website and not website.startswith('http'):
@@ -642,28 +897,34 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 social_media_data = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
                 found_emails = [email] if email else []
                 
-                # Extract social media from Google Maps page text
+                # Enhanced social media extraction from Google Maps page
                 maps_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
                 for platform, link in maps_social_data.items():
                     if link:
                         social_media_data[platform] = link
                 
-                # Enhanced website extraction
+                # Enhanced website extraction with retry mechanism
                 if website and is_valid_url(website):
                     print(f'Enhanced extraction from website: {website}')
-                    try:
-                        website_social_data, website_emails = await enhanced_extract_from_website(website, context)
-                        
-                        # Merge social media data (website takes precedence)
-                        for platform, link in website_social_data.items():
-                            if link and not social_media_data.get(platform):
-                                social_media_data[platform] = link
-                        
-                        # Add website emails
-                        found_emails.extend(website_emails)
-                        
-                    except Exception as e:
-                        print(f'Error in enhanced website extraction for {website}: {e}')
+                    max_retries = 5  # Increased from 3 to 5
+                    for retry in range(max_retries):
+                        try:
+                            website_social_data, website_emails = await enhanced_extract_from_website(website, context)
+                            
+                            # Merge social media data (website takes precedence)
+                            for platform, link in website_social_data.items():
+                                if link and not social_media_data.get(platform):
+                                    social_media_data[platform] = link
+                            
+                            # Add website emails
+                            found_emails.extend(website_emails)
+                            break
+                        except Exception as e:
+                            if retry == max_retries - 1:
+                                print(f'Error in enhanced website extraction for {website} after {max_retries} attempts: {e}')
+                            else:
+                                print(f'Retrying website extraction for {website} (attempt {retry + 1}/{max_retries})')
+                                await asyncio.sleep(1.5)  # Increased from 1 to 1.5
                 
                 # Use the best email found
                 final_email = found_emails[0] if found_emails else ''
@@ -688,6 +949,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 }
                 
                 data.append(business_data)
+                remaining_businesses -= 1
                 
                 # Count social media platforms found
                 social_count = sum(1 for platform, link in social_media_data.items() if link)
@@ -695,14 +957,25 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 print(f'  Website: {website}')
                 print(f'  Email: {final_email}')
                 print(f'  Social Platforms: {social_count}/9')
-                print(f'  Progress: {len(data)}/{max_cards} unique businesses')
+                print(f'  Progress: {len(data)}/{max_cards} businesses (Remaining: {remaining_businesses})')
+                
+                # If we've reached the target number, break the loop
+                if len(data) >= max_cards:
+                    print(f'Reached target of exactly {max_cards} unique businesses.')
+                    break
                 
             except Exception as e:
                 print(f'Error extracting business {processed_count}: {e}')
                 continue
         
+        # Check if we couldn't find enough businesses
+        if len(data) < max_cards:
+            print(f"Warning: Only found {len(data)} unique businesses out of the {max_cards} requested.")
+        
         await browser.close()
-    return data
+    
+    # Return exactly max_cards businesses or all we could find
+    return data[:max_cards]
 
 def export_to_excel(data, filename):
     """Enhanced Excel export with better formatting"""
@@ -764,8 +1037,9 @@ def run_scraper_from_ui(query, max_cards, status_label, button, stop_scroll_butt
         controller.stop_scrolling_requested = False
         controller.stop_all_requested = False
         try:
-            status_label.config(text='Enhanced scraping in progress...')
-            results = asyncio.run(scrape_google_maps(query.get(), max_cards.get(), controller=controller))
+            requested_cards = max_cards.get()
+            status_label.config(text=f'Enhanced scraping in progress for {requested_cards} businesses...')
+            results = asyncio.run(scrape_google_maps(query.get(), requested_cards, controller=controller))
             export_to_excel(results, OUTPUT_FILE)
             status_label.config(text='Enhanced extraction complete!')
             
@@ -774,13 +1048,26 @@ def run_scraper_from_ui(query, max_cards, status_label, button, stop_scroll_butt
             email_count = sum(1 for business in results if business.get('Email'))
             website_count = sum(1 for business in results if business.get('Website'))
             
-            message = f'''Enhanced Scraping Complete!
-            
-Extracted {len(results)} unique businesses
-• {email_count} businesses with emails
-• {website_count} businesses with websites  
-• {social_count} social media links found
-            
+            # Check if we got exactly what the user requested
+            if len(results) < requested_cards:
+                message = f'''Enhanced Scraping Complete!
+                
+Could only extract {len(results)} unique businesses out of the {requested_cards} requested.
+(This may be due to limited search results or duplicates)
+
+• {email_count} businesses with emails ({email_count/len(results):.1%})
+• {website_count} businesses with websites ({website_count/len(results):.1%})  
+• {social_count} total social media links found
+                
+Data exported to: {OUTPUT_FILE}'''
+            else:
+                message = f'''Enhanced Scraping Complete!
+                
+Successfully extracted {len(results)} businesses - exactly as requested!
+• {email_count} businesses with emails ({email_count/len(results):.1%})
+• {website_count} businesses with websites ({website_count/len(results):.1%})  
+• {social_count} total social media links found
+                
 Data exported to: {OUTPUT_FILE}'''
             
             messagebox.showinfo('Enhanced Extraction Complete', message)
@@ -832,23 +1119,73 @@ def launch_ui():
     cards_frame = ttk.Frame(query_frame)
     cards_frame.pack(fill=tk.X)
     
-    max_cards_label = ttk.Label(cards_frame, text='Maximum businesses to extract:')
+    max_cards_label = ttk.Label(cards_frame, text=f'Number of businesses to extract (max {MAX_BUSINESSES}):')
     max_cards_label.pack(side=tk.LEFT)
     
     max_cards_var = tk.IntVar(value=80)
     max_cards_entry = ttk.Entry(cards_frame, textvariable=max_cards_var, width=10, font=('Arial', 11))
     max_cards_entry.pack(side=tk.LEFT, padx=(10,0))
+
+    # Create a tooltip for the max cards entry
+    def create_tooltip(widget, text):
+        def enter(event):
+            x, y, _, _ = widget.bbox("insert")
+            x += widget.winfo_rootx() + 25
+            y += widget.winfo_rooty() + 20
+            
+            # Create a toplevel window
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{x}+{y}")
+            
+            label = ttk.Label(tooltip, text=text, justify=tk.LEFT,
+                             background="#ffffe0", relief="solid", borderwidth=1,
+                             font=("Arial", "9", "normal"), padding=5)
+            label.pack(ipadx=1)
+            
+            widget._tooltip = tooltip
+            
+        def leave(event):
+            if hasattr(widget, "_tooltip"):
+                widget._tooltip.destroy()
+            
+        widget.bind("<Enter>", enter)
+        widget.bind("<Leave>", leave)
+
+    create_tooltip(max_cards_entry, 
+                   f"Enter the EXACT number of businesses you want to extract (1-{MAX_BUSINESSES}).\n"
+                   f"The scraper will attempt to extract precisely this number of unique businesses.")
+
+    # Add a slider for easier selection
+    max_cards_slider = ttk.Scale(cards_frame, from_=1, to=MAX_BUSINESSES, 
+                                variable=max_cards_var, orient=tk.HORIZONTAL, length=200)
+    max_cards_slider.pack(side=tk.LEFT, padx=(10,0))
+
+    def validate_max_cards(*args):
+        try:
+            value = max_cards_var.get()
+            if value > MAX_BUSINESSES:
+                max_cards_var.set(MAX_BUSINESSES)
+                messagebox.showwarning('Input Limit', f'Maximum number of businesses is {MAX_BUSINESSES}. The value has been set to {MAX_BUSINESSES}.')
+            elif value < 1:
+                max_cards_var.set(1)
+                messagebox.showwarning('Input Limit', 'Minimum number of businesses is 1. The value has been set to 1.')
+        except:
+            max_cards_var.set(80)
+
+    max_cards_var.trace('w', validate_max_cards)
     
     # Features section
     features_frame = ttk.LabelFrame(main_frame, text='Enhanced Features', padding=15)
     features_frame.pack(fill=tk.X, pady=(0,15))
     
-    features_text = '''✓ Advanced social media link extraction (9 platforms)
+    features_text = f'''✓ Advanced social media link extraction (9 platforms)
 ✓ Robust email detection with validation
 ✓ Website crawling for additional data
 ✓ Duplicate business detection
 ✓ Enhanced data validation
-✓ Comprehensive Excel export with statistics'''
+✓ Comprehensive Excel export with statistics
+✓ Extract EXACTLY the number of businesses you specify (up to {MAX_BUSINESSES})'''
     
     features_label = ttk.Label(features_frame, text=features_text, font=('Arial', 9))
     features_label.pack(anchor=tk.W)
@@ -907,9 +1244,11 @@ def launch_ui():
     help_frame.pack(fill=tk.X)
     
     help_text = '''• Use specific search terms (e.g., "restaurants in New York" vs "food")
-• The scraper will extract emails and social links from business websites
-• Larger numbers may take longer but provide more comprehensive data
-• You can stop scrolling early and still extract data from loaded businesses'''
+• The scraper will extract EXACTLY the number of businesses you specify (if available)
+• For larger numbers (>100), the extraction process will take longer
+• The application automatically filters out duplicates to ensure unique results
+• You can stop scrolling early and still extract data from already loaded businesses
+• Use the slider or directly enter the number of businesses you want to extract'''
     
     help_label = ttk.Label(help_frame, text=help_text, font=('Arial', 9), foreground='#666666')
     help_label.pack(anchor=tk.W)
@@ -922,3 +1261,4 @@ if __name__ == '__main__':
     print("Supported platforms: Facebook, Instagram, Twitter, LinkedIn, YouTube, TikTok, Yelp, WhatsApp, Pinterest")
     print("=" * 80)
     launch_ui()
+   
