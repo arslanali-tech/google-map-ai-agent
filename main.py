@@ -29,6 +29,9 @@ GEMINI_MODEL = 'models/gemini-2.0-flash'
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 MAX_BUSINESSES = 500  # Increased maximum number of businesses
 
+# Global cache for website extraction to prevent redundant processing
+WEBSITE_EXTRACTION_CACHE = {}  # domain -> (social_data, emails)
+
 class RobustSocialExtractor:
     """Enhanced social media and email extraction class"""
     
@@ -129,16 +132,27 @@ class RobustSocialExtractor:
     
     @staticmethod
     def extract_social_from_text(text: str) -> Dict[str, str]:
-        """Extract social media links from text using advanced pattern matching"""
-        results = {}
+        """Extract social media links from text using optimized pattern matching"""
+        # Quick return for empty text
+        if not text or len(text) < 20:
+            return {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
+        
+        results = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
         text_lower = text.lower()
         
+        # First priority: Find fully formed URLs for each platform (most reliable)
         for platform, config in RobustSocialExtractor.SOCIAL_PATTERNS.items():
-            results[platform] = ''
-            
-            # First, try direct URL patterns
+            # Exit early if we already found this platform
+            if results[platform]:
+                continue
+                
+            # Quick domain check before using regex
+            if not any(domain in text_lower for domain in config['domains']):
+                continue
+                
+            # Use domain-specific regex patterns for direct URL matches
             for pattern in config['patterns']:
-                matches = re.finditer(pattern, text, re.IGNORECASE)
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
                 for match in matches:
                     # Construct full URL if needed
                     full_url = match.group(0)
@@ -157,66 +171,216 @@ class RobustSocialExtractor:
                             elif platform == 'Twitter':
                                 full_url = f"https://x.com/{username}"
                             elif platform == 'LinkedIn':
-                                full_url = f"https://linkedin.com/company/{username}"
+                                # Check if it's a company or personal profile
+                                if 'company' in match.group(0).lower():
+                                    full_url = f"https://linkedin.com/company/{username}"
+                                else:
+                                    full_url = f"https://linkedin.com/in/{username}"
                             elif platform == 'YouTube':
-                                full_url = f"https://youtube.com/channel/{username}"
+                                if '@' in username:
+                                    full_url = f"https://youtube.com/{username}"
+                                else:
+                                    full_url = f"https://youtube.com/channel/{username}"
                             elif platform == 'TikTok':
                                 full_url = f"https://tiktok.com/@{username}"
                             elif platform == 'Yelp':
                                 full_url = f"https://yelp.com/biz/{username}"
+                            elif platform == 'Pinterest':
+                                full_url = f"https://pinterest.com/{username}"
                     
                     if RobustSocialExtractor._is_valid_social_url(full_url, platform):
                         results[platform] = full_url.strip()
                         break
+                
+                # Exit early if we found a match
+                if results[platform]:
+                    break
+        
+        # Second priority: For remaining platforms, extract from https URLs
+        if not all(results.values()):
+            # Extract all https URLs once
+            url_pattern = r'https?://[^\s\'"<>()]+\.[a-zA-Z]{2,}[^\s\'"<>()]*'
+            all_urls = re.findall(url_pattern, text)
             
-            # If no direct match found, look for domain mentions with context
-            if not results[platform]:
-                for domain in config['domains']:
-                    if domain in text_lower:
-                        # Look for URL context around the domain
-                        domain_pattern = rf'https?://[^\s]*{re.escape(domain)}[^\s]*'
-                        matches = re.finditer(domain_pattern, text, re.IGNORECASE)
-                        for match in matches:
-                            url = match.group(0)
-                            if RobustSocialExtractor._is_valid_social_url(url, platform):
-                                results[platform] = url.strip()
-                                break
-                        if results[platform]:
-                            break
+            # Check each URL against remaining platforms
+            for url in all_urls:
+                for platform, link in results.items():
+                    if link:  # Skip if already found
+                        continue
+                        
+                    domains = RobustSocialExtractor.SOCIAL_PATTERNS[platform]['domains']
+                    if any(domain in url.lower() for domain in domains):
+                        if RobustSocialExtractor._is_valid_social_url(url, platform):
+                            results[platform] = url
+        
+        # Third priority: Handle social media handles with @ symbol (for specific platforms)
+        missing_platforms = ['Instagram', 'Twitter', 'TikTok']
+        missing_platforms = [p for p in missing_platforms if not results[p]]
+        
+        if missing_platforms:
+            # Find all potential handles with @ symbol (only once)
+            handle_pattern = r'@([A-Za-z0-9._]{3,30})\b'
+            handle_matches = list(re.finditer(handle_pattern, text))
+            
+            for match in handle_matches:
+                handle = match.group(1)
+                # Get context around the handle
+                start = max(0, match.start() - 20)
+                end = min(len(text), match.end() + 20)
+                context = text[start:end].lower()
+                
+                # Check if context helps identify the platform
+                if 'Instagram' in missing_platforms and ('instagram' in context or 'insta' in context):
+                    results['Instagram'] = f"https://instagram.com/{handle}"
+                elif 'Twitter' in missing_platforms and ('twitter' in context or 'tweet' in context or 'x.com' in context):
+                    results['Twitter'] = f"https://x.com/{handle}"
+                elif 'TikTok' in missing_platforms and ('tiktok' in context or 'tik tok' in context):
+                    results['TikTok'] = f"https://tiktok.com/@{handle}"
+        
+        # Final validation pass - validate all URLs once at the end
+        for platform, url in list(results.items()):
+            if url and not RobustSocialExtractor._is_valid_social_url(url, platform):
+                results[platform] = ''
         
         return results
     
     @staticmethod
     def _is_valid_social_url(url: str, platform: str) -> bool:
-        """Validate if the URL is a legitimate social media URL"""
+        """Validate if the URL is a legitimate social media URL with optimized validation"""
         if not url or len(url) < 10:
             return False
         
         try:
-            parsed = urlparse(url if url.startswith('http') else f'https://{url}')
+            # Normalize URL first
+            if not url.startswith(('http://', 'https://')):
+                url = f'https://{url}'
+                
+            parsed = urlparse(url)
             domain = parsed.netloc.lower()
+            path = parsed.path.lower()
             
-            # Check if domain matches platform
-            valid_domains = RobustSocialExtractor.SOCIAL_PATTERNS[platform]['domains']
-            if not any(valid_domain in domain for valid_domain in valid_domains):
+            # Fast domain check
+            valid_domains = RobustSocialExtractor.SOCIAL_PATTERNS.get(platform, {}).get('domains', [])
+            if not any(domain.endswith(valid_domain) or valid_domain in domain for valid_domain in valid_domains):
                 return False
             
-            # Additional validation based on platform
+            # Common validation for all platforms
+            # Reject URLs with suspicious fragments or extremely long paths
+            if len(path) > 100 or '#' in url and len(parsed.fragment) > 20:
+                return False
+                
+            # Platform-specific validation - optimized to reject obvious non-profile URLs first
             if platform == 'Facebook':
-                # Avoid generic Facebook URLs
-                if parsed.path in ['/', '/login', '/signup', '/home']:
+                # Quick rejection patterns
+                if path in ['/', '/login', '/signup', '/home', '/pages', '/groups', '/hashtag', '/events']:
                     return False
+                    
+                # Reject generic URLs with query parameters that aren't profiles
+                if path == '/' and parsed.query:
+                    return False
+                    
+                # Reject numeric-only IDs which are typically not business pages
+                if re.match(r'^/\d+/?$', path):
+                    return False
+                    
+                # Must contain a username path segment that looks valid
+                if not re.search(r'/[a-zA-Z][\w.]{2,}/?', path):
+                    return False
+                    
             elif platform == 'Instagram':
-                # Ensure it's a profile URL
-                if not parsed.path or parsed.path in ['/', '/accounts/login/']:
+                # Reject generic URLs and post/photo URLs
+                if not path or path == '/' or '/p/' in path:
                     return False
+                    
+                # Reject explore, stories, etc.
+                if any(segment in path for segment in ['/explore/', '/reels/', '/stories/']):
+                    return False
+                    
+                # Must have a valid username format
+                if not re.search(r'/[a-zA-Z][\w.]{2,}/?', path):
+                    return False
+                    
             elif platform == 'Twitter':
-                # Ensure it's a profile URL
-                if not parsed.path or parsed.path in ['/', '/login', '/home']:
+                # Reject generic paths
+                if not path or path in ['/', '/home', '/explore', '/notifications', '/messages']:
+                    return False
+                    
+                # Reject posts, hashtags, etc.
+                if any(segment in path for segment in ['/status/', '/lists/', '/i/', '/hashtag/']):
+                    return False
+                    
+                # Must have a valid username format
+                if not re.search(r'/[a-zA-Z][\w]{2,}/?', path):
+                    return False
+                    
+            elif platform == 'LinkedIn':
+                # Must be a company, school, or personal profile
+                if not any(segment in path for segment in ['/company/', '/school/', '/in/', '/pub/']):
+                    return False
+                    
+                # Ensure there's something after the segment
+                if path.endswith('/company/') or path.endswith('/in/') or path.endswith('/school/'):
+                    return False
+                    
+            elif platform == 'YouTube':
+                # Allow shortened youtu.be links
+                if 'youtu.be' in domain:
+                    return True
+                    
+                # Must be a channel, user, or custom URL
+                valid_segments = ['/channel/', '/user/', '/c/', '/@']
+                if not any(segment in path for segment in valid_segments):
+                    return False
+                    
+                # Ensure @ usernames are valid
+                if '/@' in path and not re.search(r'/@[\w-]{3,}/?', path):
+                    return False
+                    
+            elif platform == 'TikTok':
+                # Must have a username
+                if not path or (path.startswith('/@') and not re.search(r'/@[\w.]{3,}/?', path)):
+                    return False
+                    
+                # If not using @ format, must still have a valid username pattern
+                if not path.startswith('/@') and not re.search(r'/[a-zA-Z][\w.]{2,}/?', path):
+                    return False
+                    
+            elif platform == 'Yelp':
+                # Must be a business URL
+                if not path.startswith('/biz/'):
+                    return False
+                    
+                # Must have valid business name
+                if not re.search(r'/biz/[a-zA-Z0-9_-]{3,}/?', path):
+                    return False
+                    
+            elif platform == 'WhatsApp':
+                # Check for wa.me format (most common)
+                if 'wa.me' in domain:
+                    return bool(re.search(r'/\d{7,}/?', path))
+                    
+                # Check for whatsapp.com API format
+                if 'whatsapp.com' in domain:
+                    return 'phone=' in parsed.query
+                    
+            elif platform == 'Pinterest':
+                # Reject generic URLs
+                if not path or path in ['/', '/login', '/explore', '/search']:
+                    return False
+                    
+                # Must have a valid username
+                if not re.search(r'/[a-zA-Z][\w-]{2,}/?', path):
+                    return False
+                    
+                # Reject pins/boards which aren't profile URLs
+                if any(segment in path for segment in ['/pin/']):
                     return False
             
+            # Default to accepting if it passed all platform-specific checks
             return True
-        except:
+            
+        except Exception as e:
+            # Silent exception handling for performance
             return False
     
     @staticmethod
@@ -361,12 +525,60 @@ def normalize_url(url):
 
 def create_business_hash(name, address, phone):
     """Create a unique hash for a business to detect duplicates, with improved address normalization"""
+    # Handle all empty inputs
+    if not name and not address and not phone:
+        # Generate a random hash to ensure it doesn't match anything
+        return hashlib.md5(f"empty_business_{os.urandom(8).hex()}".encode()).hexdigest()
+    
+    # Normalize name: lowercase, strip whitespace, remove common business designations
     name_norm = clean_field(name).lower().strip()
-    # Use only the first part of the address (before the first comma)
-    address_main = address.split(',')[0] if address else ''
-    address_norm = clean_field(address_main).lower().strip()
-    phone_norm = re.sub(r'[^\d]', '', clean_field(phone))
-    unique_string = f"{name_norm}|{address_norm}|{phone_norm}"
+    name_norm = re.sub(r'\b(inc|llc|ltd|corp|co|company|corporation|incorporated)\b\.?', '', name_norm)
+    name_norm = re.sub(r'[^\w\s]', '', name_norm).strip()  # Remove punctuation
+    
+    # Normalize address: extract key parts and remove noise
+    address_norm = ''
+    if address:
+        # Extract only street number, name and city if possible
+        address_parts = clean_field(address).lower().split(',')
+        if address_parts:
+            # Get first part (usually street address)
+            street = address_parts[0].strip()
+            # Extract just numbers and letters from street address
+            street = re.sub(r'[^\w\s]', '', street).strip()
+            address_norm = street
+            
+            # Add city if available (usually the second part)
+            if len(address_parts) > 1:
+                city = re.sub(r'[^\w\s]', '', address_parts[1].strip())
+                address_norm = f"{address_norm}_{city}"
+    
+    # Normalize phone: strip to digits only
+    phone_norm = ''
+    if phone:
+        phone_norm = re.sub(r'[^\d]', '', clean_field(phone))
+        # Keep last 7 digits if available (more unique than country/area codes which can be shared)
+        if len(phone_norm) >= 7:
+            phone_norm = phone_norm[-7:]
+    
+    # Create weighted hash components
+    # Name is most important, then phone (which is usually unique), then address
+    if name_norm:
+        components = [f"name:{name_norm}"]
+        if phone_norm:
+            components.append(f"phone:{phone_norm}")
+        if address_norm:
+            components.append(f"addr:{address_norm}")
+    elif phone_norm:
+        # If no name, use phone as primary
+        components = [f"phone:{phone_norm}"]
+        if address_norm:
+            components.append(f"addr:{address_norm}")
+    else:
+        # Last resort, use just address
+        components = [f"addr:{address_norm}"]
+    
+    # Join components and create hash
+    unique_string = "|".join(components)
     return hashlib.md5(unique_string.encode()).hexdigest()
 
 class ScraperController:
@@ -384,24 +596,156 @@ controller = ScraperController()
 
 async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, str], List[str]]:
     """
-    Enhanced website extraction for social media links and emails
+    Enhanced website extraction for social media links and emails with performance optimizations
     Returns: (social_media_dict, email_list)
     """
     if not is_valid_url(url):
         return {}, []
     
+    # Extract domain for caching
     try:
-        print(f"Enhanced extraction from: {url}")
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc.lower()
+        
+        # Check cache first - if we've already processed this domain, return cached results
+        if domain in WEBSITE_EXTRACTION_CACHE:
+            cached_result = WEBSITE_EXTRACTION_CACHE[domain]
+            print(f"Using cached extraction for domain: {domain}")
+            return cached_result
+    except Exception as e:
+        print(f"Error parsing URL for cache check: {e}")
+        domain = None
+    
+    # Initialize results
+    social_data = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
+    emails = []
+    visited_urls = set([url])  # Track visited URLs to avoid loops
+    
+    try:
+        print(f"Extracting from: {url}")
         page = await context.new_page()
         
         try:
+            # Configure browser for better performance
             await page.set_extra_http_headers({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
             
-            # Set longer timeout and wait for network idle
-            await page.goto(url, timeout=30000, wait_until='networkidle')
-            await asyncio.sleep(3)  # Allow dynamic content to load
+            # Block unnecessary resources to speed up page loading
+            await page.route('**/*.{png,jpg,jpeg,gif,svg,webp,mp4,webm,mp3,ogg,wav}', lambda route: route.abort())
+            
+            # Increased timeout for better reliability
+            await page.goto(url, timeout=45000, wait_until='domcontentloaded')
+            await asyncio.sleep(2)  # Short wait for dynamic content
+            
+            # Enhanced social icon extraction - This is critical for sites that use icon fonts or SVGs
+            icon_social_links = await page.evaluate('''
+                () => {
+                    const results = {};
+                    const socialDomains = {
+                        'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                        'instagram': ['instagram.com', 'instagr.am'],
+                        'twitter': ['twitter.com', 'x.com', 't.co'],
+                        'linkedin': ['linkedin.com'],
+                        'youtube': ['youtube.com', 'youtu.be'],
+                        'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                        'yelp': ['yelp.com'],
+                        'whatsapp': ['wa.me', 'whatsapp.com'],
+                        'pinterest': ['pinterest.com', 'pin.it']
+                    };
+                    
+                    // Icon classes/attributes commonly used for social media
+                    const iconSelectors = {
+                        'facebook': ['fa-facebook', 'fa-facebook-f', 'fa-facebook-official', 'facebook', 'fb', 'icon-facebook'],
+                        'instagram': ['fa-instagram', 'instagram', 'insta', 'ig', 'icon-instagram'],
+                        'twitter': ['fa-twitter', 'fa-x-twitter', 'twitter', 'tweet', 'icon-twitter'],
+                        'linkedin': ['fa-linkedin', 'fa-linkedin-in', 'linkedin', 'icon-linkedin'],
+                        'youtube': ['fa-youtube', 'fa-youtube-play', 'youtube', 'yt', 'icon-youtube'],
+                        'tiktok': ['fa-tiktok', 'tiktok', 'tt', 'icon-tiktok'],
+                        'yelp': ['fa-yelp', 'yelp', 'icon-yelp'],
+                        'whatsapp': ['fa-whatsapp', 'whatsapp', 'icon-whatsapp'],
+                        'pinterest': ['fa-pinterest', 'fa-pinterest-p', 'pinterest', 'icon-pinterest']
+                    };
+                    
+                    // Find all links
+                    const links = document.querySelectorAll('a[href]');
+                    
+                    // Find social links by examining icon classes, attributes, and HTML content
+                    links.forEach(link => {
+                        // Skip if invalid href
+                        if (!link.href || link.href.startsWith('javascript:') || link.href === '#') return;
+                        
+                        // Get all class names as a string
+                        const classNames = Array.from(link.classList).join(' ').toLowerCase();
+                        
+                        // Get inner HTML
+                        const innerHTML = link.innerHTML.toLowerCase();
+                        
+                        // Get aria-label if available (often contains platform name)
+                        const ariaLabel = (link.getAttribute('aria-label') || '').toLowerCase();
+                        
+                        // Get title attribute if available (often contains platform name)
+                        const title = (link.getAttribute('title') || '').toLowerCase();
+                        
+                        // Check if the URL is a social media domain
+                        try {
+                            const url = new URL(link.href);
+                            const hostname = url.hostname.toLowerCase();
+                            
+                            // Direct domain match (highest confidence)
+                            for (const [platform, domains] of Object.entries(socialDomains)) {
+                                if (domains.some(domain => hostname.includes(domain))) {
+                                    results[platform] = link.href;
+                                    continue;
+                                }
+                            }
+                        } catch (e) {
+                            // Invalid URL, continue with other checks
+                        }
+                        
+                        // For each social platform, check if this link might be for it
+                        for (const [platform, keywords] of Object.entries(iconSelectors)) {
+                            // Skip if we already found this platform
+                            if (results[platform]) continue;
+                            
+                            // Check if any keyword matches in classes, innerHTML, aria-label, or title
+                            const matchesKeyword = keywords.some(keyword => 
+                                classNames.includes(keyword) || 
+                                innerHTML.includes(keyword) || 
+                                ariaLabel.includes(keyword) || 
+                                title.includes(keyword)
+                            );
+                            
+                            if (matchesKeyword) {
+                                // Check for icon elements inside the link
+                                const iconElement = link.querySelector('i, span.icon, .svg-icon, [class*="icon"], [class*="social"], svg');
+                                
+                                if (iconElement) {
+                                    const iconClasses = Array.from(iconElement.classList).join(' ').toLowerCase();
+                                    
+                                    // Check if icon has a platform-specific class
+                                    const hasIconClass = keywords.some(keyword => iconClasses.includes(keyword));
+                                    
+                                    if (hasIconClass || matchesKeyword) {
+                                        results[platform] = link.href;
+                                    }
+                                } else if (matchesKeyword) {
+                                    // Even without an icon element, if link strongly suggests a platform
+                                    results[platform] = link.href;
+                                }
+                            }
+                        }
+                    });
+                    
+                    return results;
+                }
+            ''')
+            
+            # Process icon-based social links (high confidence)
+            for platform_lower, link in icon_social_links.items():
+                platform = platform_lower.capitalize()
+                if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
+                    social_data[platform] = link
             
             # Get all text content including meta tags and link tags
             all_text = await page.evaluate('''
@@ -438,10 +782,24 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                 }
             ''')
             
-            # Enhanced link extraction from HTML
-            links = await page.evaluate('''
+            # Enhanced link extraction from HTML with direct social media detection
+            direct_social_links = await page.evaluate('''
                 () => {
+                    const results = {};
                     const links = new Set();
+                    
+                    // Define domain patterns for social platforms
+                    const socialDomains = {
+                        'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                        'instagram': ['instagram.com', 'instagr.am'],
+                        'twitter': ['twitter.com', 'x.com', 't.co'],
+                        'linkedin': ['linkedin.com'],
+                        'youtube': ['youtube.com', 'youtu.be'],
+                        'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                        'yelp': ['yelp.com'],
+                        'whatsapp': ['wa.me', 'whatsapp.com'],
+                        'pinterest': ['pinterest.com', 'pin.it']
+                    };
                     
                     // Get all links
                     const anchors = document.querySelectorAll('a[href]');
@@ -449,99 +807,128 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                         let href = anchor.href;
                         if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
                             try {
-                                const absoluteUrl = new URL(href, window.location.href).href;
-                                links.add(absoluteUrl);
+                                const url = new URL(href);
+                                const hostname = url.hostname.toLowerCase();
+                                
+                                // Check if it's a social media link
+                                for (const [platform, domains] of Object.entries(socialDomains)) {
+                                    if (domains.some(domain => hostname.includes(domain))) {
+                                        results[platform] = url.href;
+                                    }
+                                }
+                                
+                                // Add to general links
+                                links.add(url.href);
                             } catch (e) {
                                 // Skip invalid URLs
                             }
                         }
                     });
                     
-                    // Get all meta tags with social media URLs
-                    const metaTags = document.querySelectorAll('meta[property^="og:"], meta[property^="twitter:"], meta[name^="twitter:"]');
-                    metaTags.forEach(meta => {
-                        const content = meta.getAttribute('content');
-                        if (content && content.startsWith('http')) {
-                            links.add(content);
-                        }
-                    });
-                    
-                    // Get all link tags with social media URLs
-                    const linkTags = document.querySelectorAll('link[rel="canonical"], link[rel="alternate"]');
-                    linkTags.forEach(link => {
-                        const href = link.getAttribute('href');
-                        if (href && href.startsWith('http')) {
-                            links.add(href);
-                        }
-                    });
-                    
-                    // Get all script tags that might contain social media URLs
+                    // Get social from JSON-LD (highly reliable)
                     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
                     scripts.forEach(script => {
                         try {
                             const data = JSON.parse(script.textContent);
-                            if (data.sameAs) {
-                                data.sameAs.forEach(url => links.add(url));
-                            }
-                            if (data.url) {
-                                links.add(data.url);
+                            if (data.sameAs && Array.isArray(data.sameAs)) {
+                                data.sameAs.forEach(url => {
+                                    try {
+                                        const parsedUrl = new URL(url);
+                                        const hostname = parsedUrl.hostname.toLowerCase();
+                                        
+                                        for (const [platform, domains] of Object.entries(socialDomains)) {
+                                            if (domains.some(domain => hostname.includes(domain))) {
+                                                results[platform] = url;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        // Skip invalid URLs
+                                    }
+                                });
                             }
                         } catch (e) {
                             // Skip invalid JSON
                         }
                     });
                     
-                    return Array.from(links);
-                }
-            ''')
-            
-            # Extract social media links using enhanced extractor
-            social_data = RobustSocialExtractor.extract_social_from_text(all_text)
-            
-            # Enhance social data with found links
-            for link in links:
-                for platform, config in RobustSocialExtractor.SOCIAL_PATTERNS.items():
-                    if not social_data.get(platform):  # Only if not already found
-                        for domain in config['domains']:
-                            if domain in link.lower():
-                                if RobustSocialExtractor._is_valid_social_url(link, platform):
-                                    social_data[platform] = link
-                                    break
-            
-            # Additional social media extraction from meta tags
-            meta_social = await page.evaluate('''
-                () => {
-                    const socialData = {};
-                    const metaTags = document.querySelectorAll('meta[property^="og:"], meta[property^="twitter:"], meta[name^="twitter:"]');
+                    // Find social media in social icons (very reliable)
+                    const socialSelectors = [
+                        '.social a', '.social-media a', '.social-links a',
+                        '[class*="social"] a', '[id*="social"] a',
+                        'footer a', '.footer a', '[class*="footer"] a'
+                    ];
                     
-                    metaTags.forEach(meta => {
-                        const property = meta.getAttribute('property') || meta.getAttribute('name');
-                        const content = meta.getAttribute('content');
-                        
-                        if (property && content) {
-                            if (property.includes('facebook')) {
-                                socialData.facebook = content;
-                            } else if (property.includes('twitter')) {
-                                socialData.twitter = content;
-                            } else if (property.includes('instagram')) {
-                                socialData.instagram = content;
-                            } else if (property.includes('linkedin')) {
-                                socialData.linkedin = content;
+                    socialSelectors.forEach(selector => {
+                        document.querySelectorAll(selector).forEach(el => {
+                            const href = el.href;
+                            if (!href || href.startsWith('javascript:')) return;
+                            
+                            try {
+                                const url = new URL(href);
+                                const hostname = url.hostname.toLowerCase();
+                                
+                                for (const [platform, domains] of Object.entries(socialDomains)) {
+                                    // Check URL domain
+                                    if (domains.some(domain => hostname.includes(domain))) {
+                                        results[platform] = url.href;
+                                    }
+                                    
+                                    // Check element classes and content
+                                    const elContent = el.innerHTML.toLowerCase();
+                                    if (elContent.includes(platform) || 
+                                        Array.from(el.classList).some(c => c.toLowerCase().includes(platform))) {
+                                        for (const domain of domains) {
+                                            if (hostname.includes(domain)) {
+                                                results[platform] = url.href;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Check for icons
+                                    const img = el.querySelector('img, svg');
+                                    if (img) {
+                                        const alt = img.alt || '';
+                                        const src = img.src || '';
+                                        const classes = Array.from(img.classList).join(' ');
+                                        
+                                        if (alt.toLowerCase().includes(platform) || 
+                                            src.toLowerCase().includes(platform) ||
+                                            classes.toLowerCase().includes(platform)) {
+                                            results[platform] = url.href;
+                                        }
+                                    }
+                                }
+                            } catch (e) {
+                                // Skip invalid URLs
                             }
-                        }
+                        });
                     });
                     
-                    return socialData;
+                    return {
+                        directSocial: results,
+                        allLinks: Array.from(links)
+                    };
                 }
             ''')
             
-            # Merge meta social data
-            for platform, link in meta_social.items():
-                if link and not social_data.get(platform.capitalize()):
-                    social_data[platform.capitalize()] = link
+            # Process direct social links first (most reliable)
+            for platform_lower, link in direct_social_links['directSocial'].items():
+                platform = platform_lower.capitalize()
+                if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
+                    social_data[platform] = link
+            
+            # Extract social media links using enhanced extractor
+            text_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
+            
+            # Merge with existing social data (don't overwrite direct findings)
+            for platform, link in text_social_data.items():
+                if link and not social_data.get(platform):
+                    social_data[platform] = link
             
             # Extract emails using enhanced method
-            emails = RobustSocialExtractor.extract_emails_from_text(all_text)
+            extracted_emails = RobustSocialExtractor.extract_emails_from_text(all_text)
+            emails.extend(extracted_emails)
             
             # Also check for mailto links
             mailto_links = await page.evaluate('''
@@ -555,25 +942,212 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                 if RobustSocialExtractor._is_valid_email(email.lower()):
                     emails.append(email.lower())
             
+            # Check if we need to explore more pages
+            social_count = sum(1 for v in social_data.values() if v)
+            
+            # Only explore secondary pages if we haven't found many social links on the main page
+            # and if we found at least 1 email or social link on the main page (to confirm it's a valid business site)
+            main_page_has_valid_data = social_count > 0 or len(emails) > 0
+            
+            if social_count < 4 and main_page_has_valid_data:
+                # Important pages to check - limit to top 3 most likely pages to have social links
+                priority_paths = [
+                    '/contact', 
+                    '/about',
+                    '/social'
+                ]
+                
+                # Get the base URL
+                base_url = parsed_url.scheme + '://' + parsed_url.netloc
+                
+                # Keep track of how many pages we've checked
+                pages_checked = 0
+                max_pages_to_check = 2  # Limit to checking only 2 secondary pages
+                
+                # Check each important path
+                for path in priority_paths:
+                    # Stop if we've found enough social links or checked enough pages
+                    if sum(1 for v in social_data.values() if v) >= 4 or pages_checked >= max_pages_to_check:
+                        break
+                        
+                    page_url = urljoin(base_url, path)
+                    if page_url in visited_urls:
+                        continue
+                    
+                    visited_urls.add(page_url)
+                    pages_checked += 1
+                    
+                    try:
+                        # Use a shorter timeout for these secondary pages
+                        await page.goto(page_url, timeout=20000, wait_until='domcontentloaded')
+                        await asyncio.sleep(1)
+                        
+                        # Extract page content
+                        page_text = await page.evaluate('() => document.body.innerText')
+                        
+                        # Find social links in this page
+                        page_social = RobustSocialExtractor.extract_social_from_text(page_text)
+                        
+                        # Extract direct social links
+                        page_direct_social = await page.evaluate('''
+                            () => {
+                                const results = {};
+                                const socialDomains = {
+                                    'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                                    'instagram': ['instagram.com', 'instagr.am'],
+                                    'twitter': ['twitter.com', 'x.com', 't.co'],
+                                    'linkedin': ['linkedin.com'],
+                                    'youtube': ['youtube.com', 'youtu.be'],
+                                    'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                                    'yelp': ['yelp.com'],
+                                    'whatsapp': ['wa.me', 'whatsapp.com'],
+                                    'pinterest': ['pinterest.com', 'pin.it']
+                                };
+                                
+                                document.querySelectorAll('a[href]').forEach(anchor => {
+                                    try {
+                                        const href = anchor.href;
+                                        if (!href || href.startsWith('javascript:')) return;
+                                        
+                                        const url = new URL(href);
+                                        const hostname = url.hostname.toLowerCase();
+                                        
+                                        for (const [platform, domains] of Object.entries(socialDomains)) {
+                                            if (domains.some(domain => hostname.includes(domain))) {
+                                                results[platform] = url.href;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        // Skip invalid URLs
+                                    }
+                                });
+                                
+                                return results;
+                            }
+                        ''')
+                        
+                        # Process direct social links
+                        for platform_lower, link in page_direct_social.items():
+                            platform = platform_lower.capitalize()
+                            if platform in social_data and link and not social_data.get(platform):
+                                if RobustSocialExtractor._is_valid_social_url(link, platform):
+                                    social_data[platform] = link
+                        
+                        # Add text-extracted social links
+                        for platform, link in page_social.items():
+                            if link and not social_data.get(platform):
+                                social_data[platform] = link
+                        
+                        # Extract any additional emails
+                        page_emails = RobustSocialExtractor.extract_emails_from_text(page_text)
+                        emails.extend(page_emails)
+                        
+                        # Also check for mailto links
+                        page_mailto = await page.evaluate('''
+                            () => {
+                                const links = document.querySelectorAll('a[href^="mailto:"]');
+                                return Array.from(links).map(link => link.href.replace('mailto:', '')).filter(email => email.includes('@'));
+                            }
+                        ''')
+                        
+                        for email in page_mailto:
+                            if RobustSocialExtractor._is_valid_email(email.lower()):
+                                emails.append(email.lower())
+                    
+                    except Exception as e:
+                        # Just continue to the next page if there's an error
+                        continue
+                
+                # Check footer links directly on the main page
+                try:
+                    # Go back to the main page
+                    await page.goto(url, timeout=20000, wait_until='domcontentloaded')
+                    
+                    # Look specifically at footer links
+                    footer_social = await page.evaluate('''
+                        () => {
+                            const results = {};
+                            const socialDomains = {
+                                'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                                'instagram': ['instagram.com', 'instagr.am'],
+                                'twitter': ['twitter.com', 'x.com', 't.co'],
+                                'linkedin': ['linkedin.com'],
+                                'youtube': ['youtube.com', 'youtu.be'],
+                                'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                                'yelp': ['yelp.com'],
+                                'whatsapp': ['wa.me', 'whatsapp.com'],
+                                'pinterest': ['pinterest.com', 'pin.it']
+                            };
+                            
+                            // Look for footer elements
+                            const footers = document.querySelectorAll('footer, .footer, [class*="footer"], [id*="footer"]');
+                            
+                            footers.forEach(footer => {
+                                const links = footer.querySelectorAll('a[href]');
+                                links.forEach(link => {
+                                    try {
+                                        const href = link.href;
+                                        if (!href || href.startsWith('javascript:')) return;
+                                        
+                                        const url = new URL(href);
+                                        const hostname = url.hostname.toLowerCase();
+                                        
+                                        for (const [platform, domains] of Object.entries(socialDomains)) {
+                                            if (domains.some(domain => hostname.includes(domain))) {
+                                                results[platform] = url.href;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        // Skip invalid URLs
+                                    }
+                                });
+                            });
+                            
+                            return results;
+                        }
+                    ''')
+                    
+                    # Process footer social links
+                    for platform_lower, link in footer_social.items():
+                        platform = platform_lower.capitalize()
+                        if platform in social_data and link and not social_data.get(platform):
+                            if RobustSocialExtractor._is_valid_social_url(link, platform):
+                                social_data[platform] = link
+                                
+                except Exception as e:
+                    pass  # Silent error
+            
             # Remove duplicates from emails
             emails = list(set(emails))
             
-            print(f"Enhanced extraction complete: Social platforms found: {sum(1 for v in social_data.values() if v)}, Emails found: {len(emails)}")
+            final_social_count = sum(1 for v in social_data.values() if v)
+            print(f"Found: {final_social_count} social links, {len(emails)} emails")
+            
+            # Store in cache if we have a valid domain
+            if domain:
+                WEBSITE_EXTRACTION_CACHE[domain] = (social_data, emails)
+                
             return social_data, emails
             
         except Exception as e:
-            print(f"Error during enhanced extraction from {url}: {e}")
-            return {}, []
+            print(f"Error during extraction from {url}: {e}")
+            return social_data, emails
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except:
+                pass
             
     except Exception as e:
-        print(f"Error creating page for enhanced extraction from {url}: {e}")
+        print(f"Error creating page for {url}: {e}")
         return {}, []
 
 async def scrape_google_maps(query, max_cards=200, controller=controller):
     data = []
     unique_hashes = set()
+    
+    # Track processed domains to avoid redundancy
+    processed_website_domains = set()
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -604,23 +1178,50 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
         max_no_new_cards_scrolls = 25  # Increased to allow more scrolling attempts
         consecutive_same_count = 0
         max_consecutive_same_count = 8  # Increased to be more persistent
-        print(f'Scrolling to load cards (target: {max_cards})...')
+        print(f'Scrolling to load cards (target: {max_cards} unique businesses)...')
+        
+        # Keep track of unique businesses while scrolling
+        unique_count = 0
+        processed_titles = set()
         
         # Enhanced auto-scrolling with better performance
         while True:
             if controller.stop_all_requested:
                 print('All stopped by user during scrolling.')
-                return data
+                break
             if controller.stop_scrolling_requested:
                 print(f'Scrolling stopped by user at {last_count} cards.')
                 break
                 
             cards = await page.query_selector_all(results_selector)
             current_count = len(cards)
-            print(f'Cards loaded: {current_count} (target: {max_cards})')
             
-            # Continue scrolling until we have at least max_cards * 1.5 (to account for duplicates and failures)
-            if current_count >= max_cards * 1.5:
+            # Check for potential unique businesses
+            if unique_count == 0 and current_count > 0:
+                # Sample a few cards to estimate unique ratio
+                sample_size = min(20, current_count)
+                sample_titles = set()
+                for i in range(sample_size):
+                    try:
+                        title_text = await cards[i].evaluate('el => { const title = el.querySelector("div.fontHeadlineSmall"); return title ? title.textContent : ""; }')
+                        sample_titles.add(title_text.strip().lower())
+                    except:
+                        pass
+                
+                # Estimate unique ratio based on sample
+                unique_ratio = len(sample_titles) / sample_size if sample_size > 0 else 0.5
+                # Apply safety factor (0.7 of estimated ratio) to ensure we have enough businesses
+                unique_ratio = max(0.3, unique_ratio * 0.7)  
+                
+                # Calculate how many total cards we might need
+                estimated_total_needed = int(max_cards / unique_ratio) + 10
+                print(f'Estimated unique ratio: {unique_ratio:.2f}, need approximately {estimated_total_needed} total cards for {max_cards} unique businesses')
+            
+            # Continue scrolling until we have enough cards
+            estimated_total_needed = max(max_cards * 3, 150)  # Default estimate if we can't calculate
+            print(f'Cards loaded: {current_count}/{estimated_total_needed} (Target: {max_cards} unique businesses)')
+            
+            if current_count >= estimated_total_needed:
                 print(f'Loaded sufficient cards: {current_count}')
                 break
                 
@@ -774,35 +1375,67 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 
             await asyncio.sleep(1.5)
         
-        # Enhanced extraction loop with better social media detection
+        # Get all loaded cards
         cards = await page.query_selector_all(results_selector)
         total_cards = len(cards)
-        print(f'Starting enhanced extraction from {total_cards} cards...')
+        print(f'Starting extraction from {total_cards} cards...')
+        print(f'Target: EXACTLY {max_cards} unique businesses...')
         
+        # First, let's get all the business cards from Google Maps to ensure we have clean data
+        all_cards_data = []
+        
+        # First pass: get all card titles to help detect duplicates early
+        for idx in range(total_cards):
+            try:
+                card = cards[idx]
+                # Get just the business name to help with early duplicate detection
+                title_text = await card.evaluate('el => { const title = el.querySelector("div.fontHeadlineSmall"); return title ? title.textContent : ""; }')
+                all_cards_data.append({"idx": idx, "title": title_text.strip(), "card": card})
+            except Exception as e:
+                print(f"Error getting business title: {e}")
+                all_cards_data.append({"idx": idx, "title": "", "card": cards[idx]})
+        
+        # Process cards to extract businesses
         processed_count = 0
-        remaining_businesses = max_cards
-        max_processing_attempts = min(total_cards, max_cards * 3)  # Increased from 2 to 3 to ensure we get enough unique businesses
+        unique_count = 0
         
-        # Continue processing cards until we've extracted exactly max_cards unique businesses
-        # or until we've processed all available cards
-        for idx in range(min(total_cards, max_processing_attempts)):
+        # Continue processing until we have exactly max_cards unique businesses
+        for card_data in all_cards_data:
             if controller.stop_all_requested:
                 print('All stopped by user during extraction.')
                 break
+                
+            # If we've reached the exact number of unique businesses requested, we're done
             if len(data) >= max_cards:
-                print(f'Reached target of exactly {max_cards} unique businesses.')
+                print(f'Reached target of EXACTLY {max_cards} unique businesses!')
                 break
                 
-            # Check if we're unlikely to find enough businesses
-            remaining_cards = total_cards - idx
-            if len(data) + remaining_cards * 0.5 < max_cards:  # Reduced from 0.7 to 0.5 to be more conservative
-                print(f"Warning: May not find enough unique businesses. Currently have {len(data)}, need {max_cards}, with {remaining_cards} cards left to process.")
-                
-            card = cards[idx]
             processed_count += 1
             
+            # Calculate remaining cards and progress
+            remaining_cards = total_cards - processed_count
+            remaining_unique_needed = max_cards - len(data)
+            
+            # Check if we're unlikely to find enough businesses
+            if remaining_unique_needed > 0 and remaining_cards < remaining_unique_needed * 2:
+                print(f"Warning: May not find enough unique businesses. Need {remaining_unique_needed} more with only {remaining_cards} cards left.")
+            
+            idx = card_data["idx"]
+            card = card_data["card"]
+            title = card_data["title"]
+            
+            # Skip this business if its title matches a business we've already processed
+            if title.lower() in processed_titles:
+                print(f'Skipping duplicate title: {title}')
+                continue
+                
+            # Mark this title as processed
+            if title:
+                processed_titles.add(title.lower())
+            
             try:
-                print(f'Processing business {processed_count}/{total_cards} (Unique found: {len(data)}/{max_cards}, Remaining: {max_cards - len(data)})...')
+                print(f'Processing: {processed_count}/{total_cards} [Unique: {len(data)}/{max_cards}, Remaining: {max_cards - len(data)}]')
+                
                 await card.click()
                 await page.wait_for_selector('h1, .fontHeadlineLarge, .DUwDvf', timeout=8000)
                 await asyncio.sleep(1.5)  # Increased from 1 to 1.5
@@ -883,16 +1516,47 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                 email = clean_field(email)
                 website = clean_field(website)
                 
-                # Check for duplicates
-                business_hash = create_business_hash(name, address, phone)
-                if business_hash in unique_hashes or not name.strip():
-                    print(f'Skipping duplicate or invalid business: {name}')
+                # Skip if no business name (invalid business)
+                if not name.strip():
+                    print(f'Skipping business with no name')
                     continue
-                unique_hashes.add(business_hash)
+                    
+                # Check early if we have a duplicate name/address (improves performance)
+                name_address_match = False
+                for existing in data:
+                    if name.lower() == existing['Business Name'].lower() and (
+                        not address or not existing['Address'] or 
+                        address.lower() == existing['Address'].lower() or
+                        (address and existing['Address'] and address.split(',')[0].lower() == existing['Address'].split(',')[0].lower())
+                    ):
+                        print(f'Duplicate by name/address: {name}')
+                        name_address_match = True
+                        break
+                
+                if name_address_match:
+                    continue
+                    
+                # Generate business hash for duplicate detection
+                business_hash = create_business_hash(name, address, phone)
+                
+                # Skip if it's a duplicate (hash already exists)
+                if business_hash in unique_hashes:
+                    print(f'Duplicate: {name}')
+                    continue
                 
                 # Normalize website URL
                 if website and not website.startswith('http'):
                     website = normalize_url(website)
+                
+                # Get website domain for cache lookup
+                website_domain = None
+                if website:
+                    try:
+                        parsed_url = urlparse(website)
+                        website_domain = parsed_url.netloc.lower()
+                    except Exception as e:
+                        print(f"Error parsing website URL: {e}")
+                        website_domain = None
                 
                 # Initialize social media data
                 social_media_data = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
@@ -904,13 +1568,29 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                     if link:
                         social_media_data[platform] = link
                 
-                # Enhanced website extraction with retry mechanism
+                # Enhanced website extraction with caching
                 if website and is_valid_url(website):
-                    print(f'Enhanced extraction from website: {website}')
-                    max_retries = 5  # Increased from 3 to 5
-                    for retry in range(max_retries):
+                    # Check if we've already processed this domain before
+                    if website_domain and website_domain in processed_website_domains:
+                        print(f'Using cached extraction for domain: {website_domain}')
+                        if website_domain in WEBSITE_EXTRACTION_CACHE:
+                            cached_social, cached_emails = WEBSITE_EXTRACTION_CACHE[website_domain]
+                            
+                            # Merge with cached social data (cached takes precedence for non-empty values)
+                            for platform, link in cached_social.items():
+                                if link and not social_media_data.get(platform):
+                                    social_media_data[platform] = link
+                            
+                            # Add cached emails
+                            found_emails.extend(cached_emails)
+                    else:
+                        print(f'Enhanced extraction from website: {website}')
                         try:
                             website_social_data, website_emails = await enhanced_extract_from_website(website, context)
+                            
+                            # Mark domain as processed to avoid future redundant processing
+                            if website_domain:
+                                processed_website_domains.add(website_domain)
                             
                             # Merge social media data (website takes precedence)
                             for platform, link in website_social_data.items():
@@ -919,13 +1599,8 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                             
                             # Add website emails
                             found_emails.extend(website_emails)
-                            break
                         except Exception as e:
-                            if retry == max_retries - 1:
-                                print(f'Error in enhanced website extraction for {website} after {max_retries} attempts: {e}')
-                            else:
-                                print(f'Retrying website extraction for {website} (attempt {retry + 1}/{max_retries})')
-                                await asyncio.sleep(1.5)  # Increased from 1 to 1.5
+                            print(f'Error in website extraction: {e}')
                 
                 # Use the best email found
                 final_email = found_emails[0] if found_emails else ''
@@ -946,126 +1621,38 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
                     'TikTok': social_media_data['TikTok'],
                     'Yelp': social_media_data['Yelp'],
                     'WhatsApp': social_media_data['WhatsApp'],
-                    'Pinterest': social_media_data['Pinterest']
+                    'Pinterest': social_media_data['Pinterest'],
                 }
                 
+                # Add unique hash to set
+                unique_hashes.add(business_hash)
+                
+                # Add to data
                 data.append(business_data)
-                remaining_businesses -= 1
                 
                 # Count social media platforms found
                 social_count = sum(1 for platform, link in social_media_data.items() if link)
-                print(f'✓ Enhanced Extraction: {name}')
-                print(f'  Website: {website}')
-                print(f'  Email: {final_email}')
-                print(f'  Social Platforms: {social_count}/9')
-                print(f'  Progress: {len(data)}/{max_cards} businesses (Remaining: {remaining_businesses})')
-                
-                # If we've reached the target number, break the loop
-                if len(data) >= max_cards:
-                    print(f'Reached target of exactly {max_cards} unique businesses.')
-                    break
+                print(f'UNIQUE #{len(data)}/{max_cards} | {name} | Email: {bool(final_email)} | Social: {social_count}/9')
                 
             except Exception as e:
-                print(f'Error extracting business {processed_count}: {e}')
+                print(f'Error: {e}')
                 continue
-        
+
         # Check if we couldn't find enough businesses
         if len(data) < max_cards:
             print(f"Warning: Only found {len(data)} unique businesses out of the {max_cards} requested.")
+        else:
+            print(f"SUCCESS: Extracted EXACTLY {len(data)} unique businesses as requested!")
+
+        # Print cache statistics before closing
+        print(f"\nCache statistics:")
+        print(f"Total domains in extraction cache: {len(WEBSITE_EXTRACTION_CACHE)}")
+        print(f"Total processed website domains: {len(processed_website_domains)}")
         
         await browser.close()
-    
-    # Return exactly max_cards businesses or all we could find
-    return data[:max_cards]
-
-def export_to_excel(data, filename):
-    """Enhanced Excel export with better formatting and duplicate prevention"""
-    try:
-        df = pd.DataFrame(data)
         
-        # Reorder columns for better presentation
-        column_order = [
-            'Business Name', 'Business Type', 'Address', 'Phone Number', 
-            'Email', 'Website', 'Facebook', 'Instagram', 'Twitter', 
-            'LinkedIn', 'YouTube', 'TikTok', 'Yelp', 'WhatsApp', 'Pinterest'
-        ]
-        
-        # Only include columns that exist in the data
-        existing_columns = [col for col in column_order if col in df.columns]
-        df = df[existing_columns]
-        
-        # Clean and normalize data to prevent duplicates
-        for col in df.columns:
-            if col in ['Business Name', 'Address', 'Phone Number', 'Email', 'Website']:
-                # Convert to string and clean
-                df[col] = df[col].astype(str).apply(lambda x: clean_field(x))
-                
-                # Normalize phone numbers
-                if col == 'Phone Number':
-                    df[col] = df[col].apply(lambda x: re.sub(r'[^\d+]', '', x))
-                
-                # Normalize emails
-                if col == 'Email':
-                    df[col] = df[col].apply(lambda x: x.lower().strip())
-                
-                # Normalize websites
-                if col == 'Website':
-                    df[col] = df[col].apply(lambda x: normalize_url(x))
-        
-        # Create a composite key for duplicate detection (improved address normalization)
-        df['composite_key'] = df.apply(lambda row: create_business_hash(
-            row['Business Name'], 
-            row['Address'], 
-            row['Phone Number']
-        ), axis=1)
-        
-        # Remove duplicates based on composite key
-        initial_count = len(df)
-        df = df.drop_duplicates(subset=['composite_key'], keep='first')
-        removed_count = initial_count - len(df)
-        
-        # Remove the composite key column
-        df = df.drop('composite_key', axis=1)
-        
-        # Export to Excel
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Businesses')
-            
-            # Get the workbook and worksheet
-            workbook = writer.book
-            worksheet = writer.sheets['Businesses']
-            
-            # Auto-adjust column widths
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-        
-        print(f'Enhanced export complete: {len(df)} businesses to {filename}')
-        
-        # Print summary statistics
-        print(f'\n=== EXTRACTION SUMMARY ===')
-        print(f'Total unique businesses: {len(df)}')
-        print(f'Duplicates removed: {removed_count}')
-        print(f'Businesses with emails: {len(df[df["Email"] != ""])}')
-        print(f'Businesses with websites: {len(df[df["Website"] != ""])}')
-        
-        # Social media statistics
-        social_platforms = ['Facebook', 'Instagram', 'Twitter', 'LinkedIn', 'YouTube', 'TikTok', 'Yelp', 'WhatsApp', 'Pinterest']
-        for platform in social_platforms:
-            if platform in df.columns:
-                count = len(df[df[platform] != ""])
-                print(f'Businesses with {platform}: {count}')
-        
-    except Exception as e:
-        print(f'Error exporting to Excel: {e}')
+        # Return exactly max_cards businesses or all we could find
+        return data[:max_cards]
 
 def run_scraper_from_ui(query, max_cards, status_label, button, stop_scroll_button, stop_all_button):
     def task():
@@ -1289,6 +1876,174 @@ def launch_ui():
     help_label.pack(anchor=tk.W)
     
     root.mainloop()
+
+# Add the export_to_excel function that was defined in auth.py but missing in app.py
+def export_to_excel(data, filename):
+    """Enhanced Excel export with better formatting and duplicate prevention"""
+    try:
+        df = pd.DataFrame(data)
+        
+        # Reorder columns for better presentation
+        column_order = [
+            'Business Name', 'Business Type', 'Address', 'Phone Number', 
+            'Email', 'Website', 'Facebook', 'Instagram', 'Twitter', 
+            'LinkedIn', 'YouTube', 'TikTok', 'Yelp', 'WhatsApp', 'Pinterest'
+        ]
+        
+        # Only include columns that exist in the data
+        existing_columns = [col for col in column_order if col in df.columns]
+        df = df[existing_columns]
+        
+        # Clean and normalize data to prevent duplicates
+        for col in df.columns:
+            if col in ['Business Name', 'Address', 'Phone Number', 'Email', 'Website']:
+                # Convert to string and clean
+                df[col] = df[col].astype(str).apply(lambda x: clean_field(x))
+                
+                # Normalize phone numbers
+                if col == 'Phone Number':
+                    df[col] = df[col].apply(lambda x: re.sub(r'[^\d+]', '', x))
+                
+                # Normalize emails
+                if col == 'Email':
+                    df[col] = df[col].apply(lambda x: x.lower().strip())
+                
+                # Normalize websites
+                if col == 'Website':
+                    df[col] = df[col].apply(lambda x: normalize_url(x))
+        
+        # Create a composite key for duplicate detection (improved address normalization)
+        df['composite_key'] = df.apply(lambda row: create_business_hash(
+            row['Business Name'], 
+            row['Address'], 
+            row['Phone Number']
+        ), axis=1)
+        
+        # Remove duplicates based on composite key
+        initial_count = len(df)
+        df = df.drop_duplicates(subset=['composite_key'], keep='first')
+        removed_count = initial_count - len(df)
+        
+        # Remove the composite key column
+        df = df.drop('composite_key', axis=1)
+        
+        # Add social media completeness metrics
+        social_platforms = ['Facebook', 'Instagram', 'Twitter', 'LinkedIn', 'YouTube', 'TikTok', 'Yelp', 'WhatsApp', 'Pinterest']
+        
+        # Count social platforms per business
+        df['Social_Count'] = df[social_platforms].apply(lambda row: sum(1 for x in row if x != ""), axis=1)
+        
+        # Export to Excel
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Remove analysis columns before exporting
+            export_df = df.drop('Social_Count', axis=1)
+            export_df.to_excel(writer, index=False, sheet_name='Businesses')
+            
+            # Create summary sheet
+            summary_data = {
+                'Metric': [
+                    'Total Businesses', 
+                    'Duplicates Removed',
+                    'Businesses with Email',
+                    'Businesses with Website',
+                    'Businesses with 0 Social Platforms',
+                    'Businesses with 1-3 Social Platforms',
+                    'Businesses with 4-6 Social Platforms',
+                    'Businesses with 7+ Social Platforms',
+                    'Average Social Platforms per Business'
+                ],
+                'Value': [
+                    len(df),
+                    removed_count,
+                    len(df[df['Email'] != ""]),
+                    len(df[df['Website'] != ""]),
+                    len(df[df['Social_Count'] == 0]),
+                    len(df[(df['Social_Count'] >= 1) & (df['Social_Count'] <= 3)]),
+                    len(df[(df['Social_Count'] >= 4) & (df['Social_Count'] <= 6)]),
+                    len(df[df['Social_Count'] >= 7]),
+                    df['Social_Count'].mean()
+                ],
+                'Percentage': [
+                    '100%',
+                    f"{removed_count/initial_count:.1%}" if initial_count > 0 else "0%",
+                    f"{len(df[df['Email'] != ''])/len(df):.1%}" if len(df) > 0 else "0%",
+                    f"{len(df[df['Website'] != ''])/len(df):.1%}" if len(df) > 0 else "0%",
+                    f"{len(df[df['Social_Count'] == 0])/len(df):.1%}" if len(df) > 0 else "0%",
+                    f"{len(df[(df['Social_Count'] >= 1) & (df['Social_Count'] <= 3)])/len(df):.1%}" if len(df) > 0 else "0%",
+                    f"{len(df[(df['Social_Count'] >= 4) & (df['Social_Count'] <= 6)])/len(df):.1%}" if len(df) > 0 else "0%",
+                    f"{len(df[df['Social_Count'] >= 7])/len(df):.1%}" if len(df) > 0 else "0%",
+                    "N/A"
+                ]
+            }
+            
+            # Platform-specific stats
+            for platform in social_platforms:
+                if platform in df.columns:
+                    platform_count = len(df[df[platform] != ""])
+                    summary_data['Metric'].append(f'Businesses with {platform}')
+                    summary_data['Value'].append(platform_count)
+                    summary_data['Percentage'].append(f"{platform_count/len(df):.1%}" if len(df) > 0 else "0%")
+            
+            # Create summary dataframe and export
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, index=False, sheet_name='Summary')
+            
+            # Get the workbook and worksheet
+            workbook = writer.book
+            worksheet = writer.sheets['Businesses']
+            summary_worksheet = writer.sheets['Summary']
+            
+            # Auto-adjust column widths for main sheet
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+                
+            # Format summary sheet
+            for column in summary_worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 30)
+                summary_worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        print(f'Enhanced export complete: {len(df)} businesses to {filename}')
+        
+        # Print summary statistics
+        print(f'\n=== EXTRACTION SUMMARY ===')
+        print(f'Total unique businesses: {len(df)}')
+        print(f'Duplicates removed: {removed_count}')
+        print(f'Businesses with emails: {len(df[df["Email"] != ""])}')
+        print(f'Businesses with websites: {len(df[df["Website"] != ""])}')
+        
+        # Social media statistics
+        for platform in social_platforms:
+            if platform in df.columns:
+                count = len(df[df[platform] != ""])
+                print(f'Businesses with {platform}: {count} ({count/len(df):.1%})')
+        
+        # Social count distribution
+        print(f'\nSocial platform distribution:')
+        print(f'0 platforms: {len(df[df["Social_Count"] == 0])} ({len(df[df["Social_Count"] == 0])/len(df):.1%})')
+        print(f'1-3 platforms: {len(df[(df["Social_Count"] >= 1) & (df["Social_Count"] <= 3)])} ({len(df[(df["Social_Count"] >= 1) & (df["Social_Count"] <= 3)])/len(df):.1%})')
+        print(f'4-6 platforms: {len(df[(df["Social_Count"] >= 4) & (df["Social_Count"] <= 6)])} ({len(df[(df["Social_Count"] >= 4) & (df["Social_Count"] <= 6)])/len(df):.1%})')
+        print(f'7+ platforms: {len(df[df["Social_Count"] >= 7])} ({len(df[df["Social_Count"] >= 7])/len(df):.1%})')
+        print(f'Average platforms per business: {df["Social_Count"].mean():.1f}')
+        
+    except Exception as e:
+        print(f'Error exporting to Excel: {e}')
 
 if __name__ == '__main__':
     print("=== Enhanced Google Maps Business Scraper v2.0 ===")
