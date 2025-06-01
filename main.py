@@ -476,7 +476,16 @@ async def gemini_generate(prompt):
 
 def extract_with_gemini(raw_text):
     prompt = f"""
-Extract the following business details from the text below. Return a JSON object with these keys: Business Name, Business Type, Address, Phone Number, Email, Website. If a field is missing, use an empty string.
+Extract the following business details from the text below. Return a JSON object with these keys: Business Name, Business Type, Address, Phone Number, Email, Website, Opening Time, Closing Time, Business Hours. 
+
+For Opening Time and Closing Time, extract the standard opening and closing hours for today or the most typical day if today's hours aren't specified.
+
+For Business Hours, extract the complete weekly schedule in a standardized format with each day of the week, like this:
+"Monday: 9:00 AM - 5:00 PM; Tuesday: 9:00 AM - 5:00 PM; Wednesday: 9:00 AM - 5:00 PM; Thursday: 9:00 AM - 5:00 PM; Friday: 9:00 AM - 5:00 PM; Saturday: 10:00 AM - 3:00 PM; Sunday: Closed"
+
+Include all seven days of the week if available. For days when the business is closed, use "Closed". For businesses open 24 hours, use "Open 24 hours". If hours for a specific day are unknown, use "Hours not available".
+
+If a field is missing from the text, use an empty string.
 
 Text:
 {raw_text}
@@ -581,6 +590,45 @@ def create_business_hash(name, address, phone):
     unique_string = "|".join(components)
     return hashlib.md5(unique_string.encode()).hexdigest()
 
+def standardize_business_hours(business_hours):
+    """
+    Standardizes business hours formatting to ensure all days of the week are included
+    with consistent formatting.
+    """
+    if not business_hours:
+        return ''
+        
+    # Days of the week in order
+    days_of_week = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    
+    # Initialize a dictionary to store hours for each day
+    day_hours = {day: 'Hours not available' for day in days_of_week}
+    
+    # Split the input by semicolons or commas
+    parts = re.split(r'[;,]', business_hours)
+    
+    # Process each part
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+            
+        # Try to identify which day this part refers to
+        day_match = None
+        for day in days_of_week:
+            if part.lower().startswith(day.lower()):
+                day_match = day
+                # Extract hours portion (everything after the day name and colon)
+                hours_match = re.search(f"{day}:?\s*(.*)", part, re.IGNORECASE)
+                if hours_match:
+                    hours = hours_match.group(1).strip()
+                    day_hours[day] = hours
+                break
+    
+    # Format the result with all days of the week
+    formatted_hours = '; '.join([f"{day}: {day_hours[day]}" for day in days_of_week])
+    return formatted_hours
+
 class ScraperController:
     def __init__(self):
         self.stop_scrolling_requested = False
@@ -594,7 +642,7 @@ class ScraperController:
 
 controller = ScraperController()
 
-async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, str], List[str]]:
+async def enhanced_extract_from_website(url: str, main_context) -> Tuple[Dict[str, str], List[str]]:
     """
     Enhanced website extraction for social media links and emails with performance optimizations
     Returns: (social_media_dict, email_list)
@@ -623,373 +671,452 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
     
     try:
         print(f"Extracting from: {url}")
-        page = await context.new_page()
-        
-        try:
-            # Configure browser for better performance
-            await page.set_extra_http_headers({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            })
+        # Create a new browser context for website extraction in headless mode
+        async with async_playwright() as p:
+            website_browser = await p.chromium.launch(headless=True)  # Run website extraction in headless mode
+            website_context = await website_browser.new_context()
+            page = await website_context.new_page()
             
-            # Block unnecessary resources to speed up page loading
-            await page.route('**/*.{png,jpg,jpeg,gif,svg,webp,mp4,webm,mp3,ogg,wav}', lambda route: route.abort())
-            
-            # Increased timeout for better reliability
-            await page.goto(url, timeout=45000, wait_until='domcontentloaded')
-            await asyncio.sleep(2)  # Short wait for dynamic content
-            
-            # Enhanced social icon extraction - This is critical for sites that use icon fonts or SVGs
-            icon_social_links = await page.evaluate('''
-                () => {
-                    const results = {};
-                    const socialDomains = {
-                        'facebook': ['facebook.com', 'fb.com', 'fb.me'],
-                        'instagram': ['instagram.com', 'instagr.am'],
-                        'twitter': ['twitter.com', 'x.com', 't.co'],
-                        'linkedin': ['linkedin.com'],
-                        'youtube': ['youtube.com', 'youtu.be'],
-                        'tiktok': ['tiktok.com', 'vm.tiktok.com'],
-                        'yelp': ['yelp.com'],
-                        'whatsapp': ['wa.me', 'whatsapp.com'],
-                        'pinterest': ['pinterest.com', 'pin.it']
-                    };
-                    
-                    // Icon classes/attributes commonly used for social media
-                    const iconSelectors = {
-                        'facebook': ['fa-facebook', 'fa-facebook-f', 'fa-facebook-official', 'facebook', 'fb', 'icon-facebook'],
-                        'instagram': ['fa-instagram', 'instagram', 'insta', 'ig', 'icon-instagram'],
-                        'twitter': ['fa-twitter', 'fa-x-twitter', 'twitter', 'tweet', 'icon-twitter'],
-                        'linkedin': ['fa-linkedin', 'fa-linkedin-in', 'linkedin', 'icon-linkedin'],
-                        'youtube': ['fa-youtube', 'fa-youtube-play', 'youtube', 'yt', 'icon-youtube'],
-                        'tiktok': ['fa-tiktok', 'tiktok', 'tt', 'icon-tiktok'],
-                        'yelp': ['fa-yelp', 'yelp', 'icon-yelp'],
-                        'whatsapp': ['fa-whatsapp', 'whatsapp', 'icon-whatsapp'],
-                        'pinterest': ['fa-pinterest', 'fa-pinterest-p', 'pinterest', 'icon-pinterest']
-                    };
-                    
-                    // Find all links
-                    const links = document.querySelectorAll('a[href]');
-                    
-                    // Find social links by examining icon classes, attributes, and HTML content
-                    links.forEach(link => {
-                        // Skip if invalid href
-                        if (!link.href || link.href.startsWith('javascript:') || link.href === '#') return;
+            try:
+                # Configure browser for better performance
+                await page.set_extra_http_headers({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+                
+                # Block unnecessary resources to speed up page loading
+                await page.route('**/*.{png,jpg,jpeg,gif,svg,webp,mp4,webm,mp3,ogg,wav}', lambda route: route.abort())
+                
+                # Increased timeout for better reliability
+                await page.goto(url, timeout=45000, wait_until='domcontentloaded')
+                await asyncio.sleep(2)  # Short wait for dynamic content
+                
+                # Enhanced social icon extraction - This is critical for sites that use icon fonts or SVGs
+                icon_social_links = await page.evaluate('''
+                    () => {
+                        const results = {};
+                        const socialDomains = {
+                            'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                            'instagram': ['instagram.com', 'instagr.am'],
+                            'twitter': ['twitter.com', 'x.com', 't.co'],
+                            'linkedin': ['linkedin.com'],
+                            'youtube': ['youtube.com', 'youtu.be'],
+                            'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                            'yelp': ['yelp.com'],
+                            'whatsapp': ['wa.me', 'whatsapp.com'],
+                            'pinterest': ['pinterest.com', 'pin.it']
+                        };
                         
-                        // Get all class names as a string
-                        const classNames = Array.from(link.classList).join(' ').toLowerCase();
+                        // Icon classes/attributes commonly used for social media
+                        const iconSelectors = {
+                            'facebook': ['fa-facebook', 'fa-facebook-f', 'fa-facebook-official', 'facebook', 'fb', 'icon-facebook'],
+                            'instagram': ['fa-instagram', 'instagram', 'insta', 'ig', 'icon-instagram'],
+                            'twitter': ['fa-twitter', 'fa-x-twitter', 'twitter', 'tweet', 'icon-twitter'],
+                            'linkedin': ['fa-linkedin', 'fa-linkedin-in', 'linkedin', 'icon-linkedin'],
+                            'youtube': ['fa-youtube', 'fa-youtube-play', 'youtube', 'yt', 'icon-youtube'],
+                            'tiktok': ['fa-tiktok', 'tiktok', 'tt', 'icon-tiktok'],
+                            'yelp': ['fa-yelp', 'yelp', 'icon-yelp'],
+                            'whatsapp': ['fa-whatsapp', 'whatsapp', 'icon-whatsapp'],
+                            'pinterest': ['fa-pinterest', 'fa-pinterest-p', 'pinterest', 'icon-pinterest']
+                        };
                         
-                        // Get inner HTML
-                        const innerHTML = link.innerHTML.toLowerCase();
+                        // Find all links
+                        const links = document.querySelectorAll('a[href]');
                         
-                        // Get aria-label if available (often contains platform name)
-                        const ariaLabel = (link.getAttribute('aria-label') || '').toLowerCase();
-                        
-                        // Get title attribute if available (often contains platform name)
-                        const title = (link.getAttribute('title') || '').toLowerCase();
-                        
-                        // Check if the URL is a social media domain
-                        try {
-                            const url = new URL(link.href);
-                            const hostname = url.hostname.toLowerCase();
+                        // Find social links by examining icon classes, attributes, and HTML content
+                        links.forEach(link => {
+                            // Skip if invalid href
+                            if (!link.href || link.href.startsWith('javascript:') || link.href === '#') return;
                             
-                            // Direct domain match (highest confidence)
-                            for (const [platform, domains] of Object.entries(socialDomains)) {
-                                if (domains.some(domain => hostname.includes(domain))) {
-                                    results[platform] = link.href;
-                                    continue;
-                                }
-                            }
-                        } catch (e) {
-                            // Invalid URL, continue with other checks
-                        }
-                        
-                        // For each social platform, check if this link might be for it
-                        for (const [platform, keywords] of Object.entries(iconSelectors)) {
-                            // Skip if we already found this platform
-                            if (results[platform]) continue;
+                            // Get all class names as a string
+                            const classNames = Array.from(link.classList).join(' ').toLowerCase();
                             
-                            // Check if any keyword matches in classes, innerHTML, aria-label, or title
-                            const matchesKeyword = keywords.some(keyword => 
-                                classNames.includes(keyword) || 
-                                innerHTML.includes(keyword) || 
-                                ariaLabel.includes(keyword) || 
-                                title.includes(keyword)
-                            );
+                            // Get inner HTML
+                            const innerHTML = link.innerHTML.toLowerCase();
                             
-                            if (matchesKeyword) {
-                                // Check for icon elements inside the link
-                                const iconElement = link.querySelector('i, span.icon, .svg-icon, [class*="icon"], [class*="social"], svg');
+                            // Get aria-label if available (often contains platform name)
+                            const ariaLabel = (link.getAttribute('aria-label') || '').toLowerCase();
+                            
+                            // Get title attribute if available (often contains platform name)
+                            const title = (link.getAttribute('title') || '').toLowerCase();
+                            
+                            // Check if the URL is a social media domain
+                            try {
+                                const url = new URL(link.href);
+                                const hostname = url.hostname.toLowerCase();
                                 
-                                if (iconElement) {
-                                    const iconClasses = Array.from(iconElement.classList).join(' ').toLowerCase();
+                                // Direct domain match (highest confidence)
+                                for (const [platform, domains] of Object.entries(socialDomains)) {
+                                    if (domains.some(domain => hostname.includes(domain))) {
+                                        results[platform] = link.href;
+                                        continue;
+                                    }
+                                }
+                            } catch (e) {
+                                // Invalid URL, continue with other checks
+                            }
+                            
+                            // For each social platform, check if this link might be for it
+                            for (const [platform, keywords] of Object.entries(iconSelectors)) {
+                                // Skip if we already found this platform
+                                if (results[platform]) continue;
+                                
+                                // Check if any keyword matches in classes, innerHTML, aria-label, or title
+                                const matchesKeyword = keywords.some(keyword => 
+                                    classNames.includes(keyword) || 
+                                    innerHTML.includes(keyword) || 
+                                    ariaLabel.includes(keyword) || 
+                                    title.includes(keyword)
+                                );
+                                
+                                if (matchesKeyword) {
+                                    // Check for icon elements inside the link
+                                    const iconElement = link.querySelector('i, span.icon, .svg-icon, [class*="icon"], [class*="social"], svg');
                                     
-                                    // Check if icon has a platform-specific class
-                                    const hasIconClass = keywords.some(keyword => iconClasses.includes(keyword));
-                                    
-                                    if (hasIconClass || matchesKeyword) {
+                                    if (iconElement) {
+                                        const iconClasses = Array.from(iconElement.classList).join(' ').toLowerCase();
+                                        
+                                        // Check if icon has a platform-specific class
+                                        const hasIconClass = keywords.some(keyword => iconClasses.includes(keyword));
+                                        
+                                        if (hasIconClass || matchesKeyword) {
+                                            results[platform] = link.href;
+                                        }
+                                    } else if (matchesKeyword) {
+                                        // Even without an icon element, if link strongly suggests a platform
                                         results[platform] = link.href;
                                     }
-                                } else if (matchesKeyword) {
-                                    // Even without an icon element, if link strongly suggests a platform
-                                    results[platform] = link.href;
                                 }
                             }
-                        }
-                    });
-                    
-                    return results;
-                }
-            ''')
-            
-            # Process icon-based social links (high confidence)
-            for platform_lower, link in icon_social_links.items():
-                platform = platform_lower.capitalize()
-                if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
-                    social_data[platform] = link
-            
-            # Get all text content including meta tags and link tags
-            all_text = await page.evaluate('''
-                () => {
-                    // Get all text content
-                    const getText = (el) => {
-                        if (!el) return '';
-                        return Array.from(el.childNodes)
-                            .map(node => {
-                                if (node.nodeType === 3) return node.textContent;
-                                if (node.nodeType === 1) {
-                                    const style = window.getComputedStyle(node);
-                                    if (style.display === 'none' || style.visibility === 'hidden') return '';
-                                    return getText(node);
-                                }
-                                return '';
-                            })
-                            .join(' ')
-                            .replace(/\\s+/g, ' ')
-                            .trim();
-                    };
-                    
-                    // Get all meta tags content
-                    const metaContent = Array.from(document.getElementsByTagName('meta'))
-                        .map(meta => meta.content)
-                        .join(' ');
-                    
-                    // Get all link tags content
-                    const linkContent = Array.from(document.getElementsByTagName('link'))
-                        .map(link => link.href)
-                        .join(' ');
-                    
-                    return getText(document.body) + ' ' + metaContent + ' ' + linkContent;
-                }
-            ''')
-            
-            # Enhanced link extraction from HTML with direct social media detection
-            direct_social_links = await page.evaluate('''
-                () => {
-                    const results = {};
-                    const links = new Set();
-                    
-                    // Define domain patterns for social platforms
-                    const socialDomains = {
-                        'facebook': ['facebook.com', 'fb.com', 'fb.me'],
-                        'instagram': ['instagram.com', 'instagr.am'],
-                        'twitter': ['twitter.com', 'x.com', 't.co'],
-                        'linkedin': ['linkedin.com'],
-                        'youtube': ['youtube.com', 'youtu.be'],
-                        'tiktok': ['tiktok.com', 'vm.tiktok.com'],
-                        'yelp': ['yelp.com'],
-                        'whatsapp': ['wa.me', 'whatsapp.com'],
-                        'pinterest': ['pinterest.com', 'pin.it']
-                    };
-                    
-                    // Get all links
-                    const anchors = document.querySelectorAll('a[href]');
-                    anchors.forEach(anchor => {
-                        let href = anchor.href;
-                        if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
-                            try {
-                                const url = new URL(href);
-                                const hostname = url.hostname.toLowerCase();
-                                
-                                // Check if it's a social media link
-                                for (const [platform, domains] of Object.entries(socialDomains)) {
-                                    if (domains.some(domain => hostname.includes(domain))) {
-                                        results[platform] = url.href;
+                        });
+                        
+                        return results;
+                    }
+                ''')
+                
+                # Process icon-based social links (high confidence)
+                for platform_lower, link in icon_social_links.items():
+                    platform = platform_lower.capitalize()
+                    if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
+                        social_data[platform] = link
+                
+                # Get all text content including meta tags and link tags
+                all_text = await page.evaluate('''
+                    () => {
+                        // Get all text content
+                        const getText = (el) => {
+                            if (!el) return '';
+                            return Array.from(el.childNodes)
+                                .map(node => {
+                                    if (node.nodeType === 3) return node.textContent;
+                                    if (node.nodeType === 1) {
+                                        const style = window.getComputedStyle(node);
+                                        if (style.display === 'none' || style.visibility === 'hidden') return '';
+                                        return getText(node);
                                     }
-                                }
-                                
-                                // Add to general links
-                                links.add(url.href);
-                            } catch (e) {
-                                // Skip invalid URLs
-                            }
-                        }
-                    });
-                    
-                    // Get social from JSON-LD (highly reliable)
-                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    scripts.forEach(script => {
-                        try {
-                            const data = JSON.parse(script.textContent);
-                            if (data.sameAs && Array.isArray(data.sameAs)) {
-                                data.sameAs.forEach(url => {
-                                    try {
-                                        const parsedUrl = new URL(url);
-                                        const hostname = parsedUrl.hostname.toLowerCase();
-                                        
-                                        for (const [platform, domains] of Object.entries(socialDomains)) {
-                                            if (domains.some(domain => hostname.includes(domain))) {
-                                                results[platform] = url;
-                                            }
-                                        }
-                                    } catch (e) {
-                                        // Skip invalid URLs
-                                    }
-                                });
-                            }
-                        } catch (e) {
-                            // Skip invalid JSON
-                        }
-                    });
-                    
-                    // Find social media in social icons (very reliable)
-                    const socialSelectors = [
-                        '.social a', '.social-media a', '.social-links a',
-                        '[class*="social"] a', '[id*="social"] a',
-                        'footer a', '.footer a', '[class*="footer"] a'
-                    ];
-                    
-                    socialSelectors.forEach(selector => {
-                        document.querySelectorAll(selector).forEach(el => {
-                            const href = el.href;
-                            if (!href || href.startsWith('javascript:')) return;
-                            
-                            try {
-                                const url = new URL(href);
-                                const hostname = url.hostname.toLowerCase();
-                                
-                                for (const [platform, domains] of Object.entries(socialDomains)) {
-                                    // Check URL domain
-                                    if (domains.some(domain => hostname.includes(domain))) {
-                                        results[platform] = url.href;
-                                    }
+                                    return '';
+                                })
+                                .join(' ')
+                                .replace(/\\s+/g, ' ')
+                                .trim();
+                        };
+                        
+                        // Get all meta tags content
+                        const metaContent = Array.from(document.getElementsByTagName('meta'))
+                            .map(meta => meta.content)
+                            .join(' ');
+                        
+                        // Get all link tags content
+                        const linkContent = Array.from(document.getElementsByTagName('link'))
+                            .map(link => link.href)
+                            .join(' ');
+                        
+                        return getText(document.body) + ' ' + metaContent + ' ' + linkContent;
+                    }
+                ''')
+                
+                # Enhanced link extraction from HTML with direct social media detection
+                direct_social_links = await page.evaluate('''
+                    () => {
+                        const results = {};
+                        const links = new Set();
+                        
+                        // Define domain patterns for social platforms
+                        const socialDomains = {
+                            'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                            'instagram': ['instagram.com', 'instagr.am'],
+                            'twitter': ['twitter.com', 'x.com', 't.co'],
+                            'linkedin': ['linkedin.com'],
+                            'youtube': ['youtube.com', 'youtu.be'],
+                            'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                            'yelp': ['yelp.com'],
+                            'whatsapp': ['wa.me', 'whatsapp.com'],
+                            'pinterest': ['pinterest.com', 'pin.it']
+                        };
+                        
+                        // Get all links
+                        const anchors = document.querySelectorAll('a[href]');
+                        anchors.forEach(anchor => {
+                            let href = anchor.href;
+                            if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+                                try {
+                                    const url = new URL(href);
+                                    const hostname = url.hostname.toLowerCase();
                                     
-                                    // Check element classes and content
-                                    const elContent = el.innerHTML.toLowerCase();
-                                    if (elContent.includes(platform) || 
-                                        Array.from(el.classList).some(c => c.toLowerCase().includes(platform))) {
-                                        for (const domain of domains) {
-                                            if (hostname.includes(domain)) {
-                                                results[platform] = url.href;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Check for icons
-                                    const img = el.querySelector('img, svg');
-                                    if (img) {
-                                        const alt = img.alt || '';
-                                        const src = img.src || '';
-                                        const classes = Array.from(img.classList).join(' ');
-                                        
-                                        if (alt.toLowerCase().includes(platform) || 
-                                            src.toLowerCase().includes(platform) ||
-                                            classes.toLowerCase().includes(platform)) {
+                                    // Check if it's a social media link
+                                    for (const [platform, domains] of Object.entries(socialDomains)) {
+                                        if (domains.some(domain => hostname.includes(domain))) {
                                             results[platform] = url.href;
                                         }
                                     }
+                                    
+                                    // Add to general links
+                                    links.add(url.href);
+                                } catch (e) {
+                                    // Skip invalid URLs
                                 }
-                            } catch (e) {
-                                // Skip invalid URLs
                             }
                         });
-                    });
-                    
-                    return {
-                        directSocial: results,
-                        allLinks: Array.from(links)
-                    };
-                }
-            ''')
-            
-            # Process direct social links first (most reliable)
-            for platform_lower, link in direct_social_links['directSocial'].items():
-                platform = platform_lower.capitalize()
-                if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
-                    social_data[platform] = link
-            
-            # Extract social media links using enhanced extractor
-            text_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
-            
-            # Merge with existing social data (don't overwrite direct findings)
-            for platform, link in text_social_data.items():
-                if link and not social_data.get(platform):
-                    social_data[platform] = link
-            
-            # Extract emails using enhanced method
-            extracted_emails = RobustSocialExtractor.extract_emails_from_text(all_text)
-            emails.extend(extracted_emails)
-            
-            # Also check for mailto links
-            mailto_links = await page.evaluate('''
-                () => {
-                    const mailtoLinks = document.querySelectorAll('a[href^="mailto:"]');
-                    return Array.from(mailtoLinks).map(link => link.href.replace('mailto:', '')).filter(email => email.includes('@'));
-                }
-            ''')
-            
-            for email in mailto_links:
-                if RobustSocialExtractor._is_valid_email(email.lower()):
-                    emails.append(email.lower())
-            
-            # Check if we need to explore more pages
-            social_count = sum(1 for v in social_data.values() if v)
-            
-            # Only explore secondary pages if we haven't found many social links on the main page
-            # and if we found at least 1 email or social link on the main page (to confirm it's a valid business site)
-            main_page_has_valid_data = social_count > 0 or len(emails) > 0
-            
-            if social_count < 4 and main_page_has_valid_data:
-                # Important pages to check - limit to top 3 most likely pages to have social links
-                priority_paths = [
-                    '/contact', 
-                    '/about',
-                    '/social'
-                ]
-                
-                # Get the base URL
-                base_url = parsed_url.scheme + '://' + parsed_url.netloc
-                
-                # Keep track of how many pages we've checked
-                pages_checked = 0
-                max_pages_to_check = 2  # Limit to checking only 2 secondary pages
-                
-                # Check each important path
-                for path in priority_paths:
-                    # Stop if we've found enough social links or checked enough pages
-                    if sum(1 for v in social_data.values() if v) >= 4 or pages_checked >= max_pages_to_check:
-                        break
                         
-                    page_url = urljoin(base_url, path)
-                    if page_url in visited_urls:
-                        continue
+                        // Get social from JSON-LD (highly reliable)
+                        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                        scripts.forEach(script => {
+                            try {
+                                const data = JSON.parse(script.textContent);
+                                if (data.sameAs && Array.isArray(data.sameAs)) {
+                                    data.sameAs.forEach(url => {
+                                        try {
+                                            const parsedUrl = new URL(url);
+                                            const hostname = parsedUrl.hostname.toLowerCase();
+                                            
+                                            for (const [platform, domains] of Object.entries(socialDomains)) {
+                                                if (domains.some(domain => hostname.includes(domain))) {
+                                                    results[platform] = url;
+                                                }
+                                            }
+                                        } catch (e) {
+                                            // Skip invalid URLs
+                                        }
+                                    });
+                                }
+                            } catch (e) {
+                                // Skip invalid JSON
+                            }
+                        });
+                        
+                        // Find social media in social icons (very reliable)
+                        const socialSelectors = [
+                            '.social a', '.social-media a', '.social-links a',
+                            '[class*="social"] a', '[id*="social"] a',
+                            'footer a', '.footer a', '[class*="footer"] a'
+                        ];
+                        
+                        socialSelectors.forEach(selector => {
+                            document.querySelectorAll(selector).forEach(el => {
+                                const href = el.href;
+                                if (!href || href.startsWith('javascript:')) return;
+                                
+                                try {
+                                    const url = new URL(href);
+                                    const hostname = url.hostname.toLowerCase();
+                                    
+                                    for (const [platform, domains] of Object.entries(socialDomains)) {
+                                        // Check URL domain
+                                        if (domains.some(domain => hostname.includes(domain))) {
+                                            results[platform] = url.href;
+                                        }
+                                        
+                                        // Check element classes and content
+                                        const elContent = el.innerHTML.toLowerCase();
+                                        if (elContent.includes(platform) || 
+                                            Array.from(el.classList).some(c => c.toLowerCase().includes(platform))) {
+                                            for (const domain of domains) {
+                                                if (hostname.includes(domain)) {
+                                                    results[platform] = url.href;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Check for icons
+                                        const img = el.querySelector('img, svg');
+                                        if (img) {
+                                            const alt = img.alt || '';
+                                            const src = img.src || '';
+                                            const classes = Array.from(img.classList).join(' ');
+                                            
+                                            if (alt.toLowerCase().includes(platform) || 
+                                                src.toLowerCase().includes(platform) ||
+                                                classes.toLowerCase().includes(platform)) {
+                                                results[platform] = url.href;
+                                            }
+                                        }
+                                    }
+                                } catch (e) {
+                                    // Skip invalid URLs
+                                }
+                            });
+                        });
+                        
+                        return {
+                            directSocial: results,
+                            allLinks: Array.from(links)
+                        };
+                    }
+                ''')
+                
+                # Process direct social links first (most reliable)
+                for platform_lower, link in direct_social_links['directSocial'].items():
+                    platform = platform_lower.capitalize()
+                    if platform in social_data and link and RobustSocialExtractor._is_valid_social_url(link, platform):
+                        social_data[platform] = link
+                
+                # Extract social media links using enhanced extractor
+                text_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
+                
+                # Merge with existing social data (don't overwrite direct findings)
+                for platform, link in text_social_data.items():
+                    if link and not social_data.get(platform):
+                        social_data[platform] = link
+                
+                # Extract emails using enhanced method
+                extracted_emails = RobustSocialExtractor.extract_emails_from_text(all_text)
+                emails.extend(extracted_emails)
+                
+                # Also check for mailto links
+                mailto_links = await page.evaluate('''
+                    () => {
+                        const mailtoLinks = document.querySelectorAll('a[href^="mailto:"]');
+                        return Array.from(mailtoLinks).map(link => link.href.replace('mailto:', '')).filter(email => email.includes('@'));
+                    }
+                ''')
+                
+                for email in mailto_links:
+                    if RobustSocialExtractor._is_valid_email(email.lower()):
+                        emails.append(email.lower())
+                
+                # Check if we need to explore more pages
+                social_count = sum(1 for v in social_data.values() if v)
+                
+                # Only explore secondary pages if we haven't found many social links on the main page
+                # and if we found at least 1 email or social link on the main page (to confirm it's a valid business site)
+                main_page_has_valid_data = social_count > 0 or len(emails) > 0
+                
+                if social_count < 4 and main_page_has_valid_data:
+                    # Important pages to check - limit to top 3 most likely pages to have social links
+                    priority_paths = [
+                        '/contact', 
+                        '/about',
+                        '/social'
+                    ]
                     
-                    visited_urls.add(page_url)
-                    pages_checked += 1
+                    # Get the base URL
+                    base_url = parsed_url.scheme + '://' + parsed_url.netloc
                     
+                    # Keep track of how many pages we've checked
+                    pages_checked = 0
+                    max_pages_to_check = 2  # Limit to checking only 2 secondary pages
+                    
+                    # Check each important path
+                    for path in priority_paths:
+                        # Stop if we've found enough social links or checked enough pages
+                        if sum(1 for v in social_data.values() if v) >= 4 or pages_checked >= max_pages_to_check:
+                            break
+                            
+                        page_url = urljoin(base_url, path)
+                        if page_url in visited_urls:
+                            continue
+                        
+                        visited_urls.add(page_url)
+                        pages_checked += 1
+                        
+                        try:
+                            # Use a shorter timeout for these secondary pages
+                            await page.goto(page_url, timeout=20000, wait_until='domcontentloaded')
+                            await asyncio.sleep(1)
+                            
+                            # Extract page content
+                            page_text = await page.evaluate('() => document.body.innerText')
+                            
+                            # Find social links in this page
+                            page_social = RobustSocialExtractor.extract_social_from_text(page_text)
+                            
+                            # Extract direct social links
+                            page_direct_social = await page.evaluate('''
+                                () => {
+                                    const results = {};
+                                    const socialDomains = {
+                                        'facebook': ['facebook.com', 'fb.com', 'fb.me'],
+                                        'instagram': ['instagram.com', 'instagr.am'],
+                                        'twitter': ['twitter.com', 'x.com', 't.co'],
+                                        'linkedin': ['linkedin.com'],
+                                        'youtube': ['youtube.com', 'youtu.be'],
+                                        'tiktok': ['tiktok.com', 'vm.tiktok.com'],
+                                        'yelp': ['yelp.com'],
+                                        'whatsapp': ['wa.me', 'whatsapp.com'],
+                                        'pinterest': ['pinterest.com', 'pin.it']
+                                    };
+                                    
+                                    document.querySelectorAll('a[href]').forEach(anchor => {
+                                        try {
+                                            const href = anchor.href;
+                                            if (!href || href.startsWith('javascript:')) return;
+                                            
+                                            const url = new URL(href);
+                                            const hostname = url.hostname.toLowerCase();
+                                            
+                                            for (const [platform, domains] of Object.entries(socialDomains)) {
+                                                if (domains.some(domain => hostname.includes(domain))) {
+                                                    results[platform] = url.href;
+                                                }
+                                            }
+                                        } catch (e) {
+                                            // Skip invalid URLs
+                                        }
+                                    });
+                                    
+                                    return results;
+                                }
+                            ''')
+                            
+                            # Process direct social links
+                            for platform_lower, link in page_direct_social.items():
+                                platform = platform_lower.capitalize()
+                                if platform in social_data and link and not social_data.get(platform):
+                                    if RobustSocialExtractor._is_valid_social_url(link, platform):
+                                        social_data[platform] = link
+                            
+                            # Add text-extracted social links
+                            for platform, link in page_social.items():
+                                if link and not social_data.get(platform):
+                                    social_data[platform] = link
+                            
+                            # Extract any additional emails
+                            page_emails = RobustSocialExtractor.extract_emails_from_text(page_text)
+                            emails.extend(page_emails)
+                            
+                            # Also check for mailto links
+                            page_mailto = await page.evaluate('''
+                                () => {
+                                    const links = document.querySelectorAll('a[href^="mailto:"]');
+                                    return Array.from(links).map(link => link.href.replace('mailto:', '')).filter(email => email.includes('@'));
+                                }
+                            ''')
+                            
+                            for email in page_mailto:
+                                if RobustSocialExtractor._is_valid_email(email.lower()):
+                                    emails.append(email.lower())
+                        
+                        except Exception as e:
+                            # Just continue to the next page if there's an error
+                            continue
+                    
+                    # Check footer links directly on the main page
                     try:
-                        # Use a shorter timeout for these secondary pages
-                        await page.goto(page_url, timeout=20000, wait_until='domcontentloaded')
-                        await asyncio.sleep(1)
+                        # Go back to the main page
+                        await page.goto(url, timeout=20000, wait_until='domcontentloaded')
                         
-                        # Extract page content
-                        page_text = await page.evaluate('() => document.body.innerText')
-                        
-                        # Find social links in this page
-                        page_social = RobustSocialExtractor.extract_social_from_text(page_text)
-                        
-                        # Extract direct social links
-                        page_direct_social = await page.evaluate('''
+                        # Look specifically at footer links
+                        footer_social = await page.evaluate('''
                             () => {
                                 const results = {};
                                 const socialDomains = {
@@ -1004,140 +1131,67 @@ async def enhanced_extract_from_website(url: str, context) -> Tuple[Dict[str, st
                                     'pinterest': ['pinterest.com', 'pin.it']
                                 };
                                 
-                                document.querySelectorAll('a[href]').forEach(anchor => {
-                                    try {
-                                        const href = anchor.href;
-                                        if (!href || href.startsWith('javascript:')) return;
-                                        
-                                        const url = new URL(href);
-                                        const hostname = url.hostname.toLowerCase();
-                                        
-                                        for (const [platform, domains] of Object.entries(socialDomains)) {
-                                            if (domains.some(domain => hostname.includes(domain))) {
-                                                results[platform] = url.href;
+                                // Look for footer elements
+                                const footers = document.querySelectorAll('footer, .footer, [class*="footer"], [id*="footer"]');
+                                
+                                footers.forEach(footer => {
+                                    const links = footer.querySelectorAll('a[href]');
+                                    links.forEach(link => {
+                                        try {
+                                            const href = link.href;
+                                            if (!href || href.startsWith('javascript:')) return;
+                                            
+                                            const url = new URL(href);
+                                            const hostname = url.hostname.toLowerCase();
+                                            
+                                            for (const [platform, domains] of Object.entries(socialDomains)) {
+                                                if (domains.some(domain => hostname.includes(domain))) {
+                                                    results[platform] = url.href;
+                                                }
                                             }
+                                        } catch (e) {
+                                            // Skip invalid URLs
                                         }
-                                    } catch (e) {
-                                        // Skip invalid URLs
-                                    }
+                                    });
                                 });
                                 
                                 return results;
                             }
                         ''')
                         
-                        # Process direct social links
-                        for platform_lower, link in page_direct_social.items():
+                        # Process footer social links
+                        for platform_lower, link in footer_social.items():
                             platform = platform_lower.capitalize()
                             if platform in social_data and link and not social_data.get(platform):
                                 if RobustSocialExtractor._is_valid_social_url(link, platform):
                                     social_data[platform] = link
-                        
-                        # Add text-extracted social links
-                        for platform, link in page_social.items():
-                            if link and not social_data.get(platform):
-                                social_data[platform] = link
-                        
-                        # Extract any additional emails
-                        page_emails = RobustSocialExtractor.extract_emails_from_text(page_text)
-                        emails.extend(page_emails)
-                        
-                        # Also check for mailto links
-                        page_mailto = await page.evaluate('''
-                            () => {
-                                const links = document.querySelectorAll('a[href^="mailto:"]');
-                                return Array.from(links).map(link => link.href.replace('mailto:', '')).filter(email => email.includes('@'));
-                            }
-                        ''')
-                        
-                        for email in page_mailto:
-                            if RobustSocialExtractor._is_valid_email(email.lower()):
-                                emails.append(email.lower())
-                    
+                                    
                     except Exception as e:
-                        # Just continue to the next page if there's an error
-                        continue
+                        pass  # Silent error
                 
-                # Check footer links directly on the main page
+                # Remove duplicates from emails
+                emails = list(set(emails))
+                
+                final_social_count = sum(1 for v in social_data.values() if v)
+                print(f"Found: {final_social_count} social links, {len(emails)} emails")
+                
+                # Store in cache if we have a valid domain
+                if domain:
+                    WEBSITE_EXTRACTION_CACHE[domain] = (social_data, emails)
+                    
+                # Close the website browser
+                await website_browser.close()
+                    
+                return social_data, emails
+                
+            except Exception as e:
+                print(f"Error during extraction from {url}: {e}")
                 try:
-                    # Go back to the main page
-                    await page.goto(url, timeout=20000, wait_until='domcontentloaded')
-                    
-                    # Look specifically at footer links
-                    footer_social = await page.evaluate('''
-                        () => {
-                            const results = {};
-                            const socialDomains = {
-                                'facebook': ['facebook.com', 'fb.com', 'fb.me'],
-                                'instagram': ['instagram.com', 'instagr.am'],
-                                'twitter': ['twitter.com', 'x.com', 't.co'],
-                                'linkedin': ['linkedin.com'],
-                                'youtube': ['youtube.com', 'youtu.be'],
-                                'tiktok': ['tiktok.com', 'vm.tiktok.com'],
-                                'yelp': ['yelp.com'],
-                                'whatsapp': ['wa.me', 'whatsapp.com'],
-                                'pinterest': ['pinterest.com', 'pin.it']
-                            };
-                            
-                            // Look for footer elements
-                            const footers = document.querySelectorAll('footer, .footer, [class*="footer"], [id*="footer"]');
-                            
-                            footers.forEach(footer => {
-                                const links = footer.querySelectorAll('a[href]');
-                                links.forEach(link => {
-                                    try {
-                                        const href = link.href;
-                                        if (!href || href.startsWith('javascript:')) return;
-                                        
-                                        const url = new URL(href);
-                                        const hostname = url.hostname.toLowerCase();
-                                        
-                                        for (const [platform, domains] of Object.entries(socialDomains)) {
-                                            if (domains.some(domain => hostname.includes(domain))) {
-                                                results[platform] = url.href;
-                                            }
-                                        }
-                                    } catch (e) {
-                                        // Skip invalid URLs
-                                    }
-                                });
-                            });
-                            
-                            return results;
-                        }
-                    ''')
-                    
-                    # Process footer social links
-                    for platform_lower, link in footer_social.items():
-                        platform = platform_lower.capitalize()
-                        if platform in social_data and link and not social_data.get(platform):
-                            if RobustSocialExtractor._is_valid_social_url(link, platform):
-                                social_data[platform] = link
-                                
-                except Exception as e:
-                    pass  # Silent error
-            
-            # Remove duplicates from emails
-            emails = list(set(emails))
-            
-            final_social_count = sum(1 for v in social_data.values() if v)
-            print(f"Found: {final_social_count} social links, {len(emails)} emails")
-            
-            # Store in cache if we have a valid domain
-            if domain:
-                WEBSITE_EXTRACTION_CACHE[domain] = (social_data, emails)
+                    await website_browser.close()
+                except:
+                    pass
+                return social_data, emails
                 
-            return social_data, emails
-            
-        except Exception as e:
-            print(f"Error during extraction from {url}: {e}")
-            return social_data, emails
-        finally:
-            try:
-                await page.close()
-            except:
-                pass
-            
     except Exception as e:
         print(f"Error creating page for {url}: {e}")
         return {}, []
@@ -1150,7 +1204,7 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
     processed_website_domains = set()
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=False)  # Show the Google Maps browser window
         context = await browser.new_context()
         page = await context.new_page()
         
@@ -1173,479 +1227,575 @@ async def scrape_google_maps(query, max_cards=200, controller=controller):
         if not scrollable:
             scrollable = page
 
-        last_count = 0
-        no_new_cards_scrolls = 0
-        max_no_new_cards_scrolls = 25  # Increased to allow more scrolling attempts
-        consecutive_same_count = 0
-        max_consecutive_same_count = 8  # Increased to be more persistent
-        print(f'Scrolling to load cards (target: {max_cards} unique businesses)...')
-        
-        # Keep track of unique businesses while scrolling
-        unique_count = 0
+        # Initialize tracking variables
         processed_titles = set()
+        processed_cards = set()
+        no_new_cards_scrolls = 0
+        max_no_new_cards_scrolls = 12  # Reduced from 25 to make process faster
+        consecutive_same_count = 0
+        max_consecutive_same_count = 5  # Reduced from 8 to make process faster
         
-        # Enhanced auto-scrolling with better performance
-        while True:
-            if controller.stop_all_requested:
-                print('All stopped by user during scrolling.')
-                break
-            if controller.stop_scrolling_requested:
-                print(f'Scrolling stopped by user at {last_count} cards.')
-                break
-                
-            cards = await page.query_selector_all(results_selector)
-            current_count = len(cards)
-            
-            # Check for potential unique businesses
-            if unique_count == 0 and current_count > 0:
-                # Sample a few cards to estimate unique ratio
-                sample_size = min(20, current_count)
-                sample_titles = set()
-                for i in range(sample_size):
-                    try:
-                        title_text = await cards[i].evaluate('el => { const title = el.querySelector("div.fontHeadlineSmall"); return title ? title.textContent : ""; }')
-                        sample_titles.add(title_text.strip().lower())
-                    except:
-                        pass
-                
-                # Estimate unique ratio based on sample
-                unique_ratio = len(sample_titles) / sample_size if sample_size > 0 else 0.5
-                # Apply safety factor (0.7 of estimated ratio) to ensure we have enough businesses
-                unique_ratio = max(0.3, unique_ratio * 0.7)  
-                
-                # Calculate how many total cards we might need
-                estimated_total_needed = int(max_cards / unique_ratio) + 10
-                print(f'Estimated unique ratio: {unique_ratio:.2f}, need approximately {estimated_total_needed} total cards for {max_cards} unique businesses')
-            
-            # Continue scrolling until we have enough cards
-            estimated_total_needed = max(max_cards * 3, 150)  # Default estimate if we can't calculate
-            print(f'Cards loaded: {current_count}/{estimated_total_needed} (Target: {max_cards} unique businesses)')
-            
-            if current_count >= estimated_total_needed:
-                print(f'Loaded sufficient cards: {current_count}')
-                break
-                
-            if current_count == last_count:
-                no_new_cards_scrolls += 1
-                consecutive_same_count += 1
-                
-                # If we get the same count multiple times, try a more aggressive scroll
-                if consecutive_same_count >= 2:
-                    print(f"Same count {consecutive_same_count} times in a row. Trying aggressive scroll...")
-                    try:
-                        # More aggressive scrolling with multiple techniques
-                        for _ in range(8):  # Increased from 5 to 8
-                            # Use multiple scrolling methods simultaneously
-                            await page.evaluate('''
-                                () => {
-                                    // Scroll the main container
-                                    const mainContainer = document.querySelector('div[role="main"] div[aria-label][tabindex="0"]');
-                                    if (mainContainer) {
-                                        mainContainer.scrollBy(0, 3000);
-                                    }
-                                    
-                                    // Scroll the window
-                                    window.scrollBy(0, 2000);
-                                    
-                                    // Force scroll event
-                                    const scrollEvent = new Event('scroll', { bubbles: true });
-                                    if (mainContainer) mainContainer.dispatchEvent(scrollEvent);
-                                    window.dispatchEvent(scrollEvent);
-                                }
-                            ''')
-                            
-                            # Use keyboard and mouse wheel
-                            await page.keyboard.press('End')
-                            await page.mouse.wheel(0, 3000)
-                            await asyncio.sleep(0.3)
-                            
-                            # Try clicking "Show more results" if available
-                            try:
-                                show_more = await page.query_selector('button[jsaction*="pane.showMoreResults"]')
-                                if show_more:
-                                    await show_more.click()
-                                    await asyncio.sleep(1)
-                            except:
-                                pass
-                            
-                            await asyncio.sleep(0.3)
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        print(f"Aggressive scroll failed: {e}")
-                
-                if no_new_cards_scrolls >= max_no_new_cards_scrolls:
-                    print(f'No more new cards found after {max_no_new_cards_scrolls} attempts. Total: {current_count}')
-                    break
-            else:
-                no_new_cards_scrolls = 0
-                consecutive_same_count = 0
-                
-            last_count = current_count
-            
-            # Enhanced auto-scrolling with multiple techniques
-            try:
-                # Improved scrolling mechanism with multiple methods
-                await page.evaluate('''
-                    (selector) => {
-                        const scrollable = document.querySelector(selector);
-                        if (scrollable) {
-                            // Calculate scroll amount based on container height
-                            const scrollAmount = Math.max(2500, scrollable.scrollHeight * 0.8);
-                            
-                            // Smooth scroll with easing
-                            const start = scrollable.scrollTop;
-                            const end = start + scrollAmount;
-                            const duration = 1000;
-                            const startTime = performance.now();
-                            
-                            function easeInOutQuad(t) {
-                                return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-                            }
-                            
-                            function scroll() {
-                                const now = performance.now();
-                                const elapsed = now - startTime;
-                                const progress = Math.min(elapsed / duration, 1);
-                                const eased = easeInOutQuad(progress);
-                                
-                                scrollable.scrollTop = start + (end - start) * eased;
-                                
-                                if (progress < 1) {
-                                    requestAnimationFrame(scroll);
-                                }
-                            }
-                            
-                            scroll();
-                            
-                            // Force scroll event
-                            const scrollEvent = new Event('scroll', { bubbles: true });
-                            scrollable.dispatchEvent(scrollEvent);
-                        }
-                    }
-                ''', scrollable_selector)
-                
-                # Additional scrolling methods
-                for _ in range(10):  # Increased from 8 to 10
-                    if controller.stop_all_requested or controller.stop_scrolling_requested:
-                        break
-                        
-                    # Use multiple scrolling techniques
-                    await page.keyboard.press('PageDown')
-                    await page.mouse.wheel(0, 1000)
-                    
-                    # Try to find and click "Show more results" button
-                    try:
-                        show_more = await page.query_selector('button[jsaction*="pane.showMoreResults"]')
-                        if show_more:
-                            await show_more.click()
-                            await asyncio.sleep(1)
-                    except:
-                        pass
-                    
-                    await asyncio.sleep(0.2)
-                
-                # Wait for potential new content to load
-                await asyncio.sleep(1.5)
-                
-            except Exception as e:
-                print(f'Scrolling error: {e}')
-                # Try alternative scrolling methods if the first one fails
-                try:
-                    # Try multiple alternative scrolling methods
-                    await page.evaluate('''
-                        () => {
-                            // Try scrolling the main container
-                            const mainContainer = document.querySelector('div[role="main"] div[aria-label][tabindex="0"]');
-                            if (mainContainer) {
-                                mainContainer.scrollBy(0, 2000);
-                            }
-                            
-                            // Try scrolling the window
-                            window.scrollBy(0, 1500);
-                            
-                            // Try clicking "Show more results" if available
-                            const showMore = document.querySelector('button[jsaction*="pane.showMoreResults"]');
-                            if (showMore) showMore.click();
-                        }
-                    ''')
-                    await asyncio.sleep(1)
-                except Exception as e2:
-                    print(f'Alternative scrolling also failed: {e2}')
-                continue
-                
-            await asyncio.sleep(1.5)
+        print(f'Starting incremental extraction (target: {max_cards} unique businesses)...')
         
-        # Get all loaded cards
-        cards = await page.query_selector_all(results_selector)
-        total_cards = len(cards)
-        print(f'Starting extraction from {total_cards} cards...')
-        print(f'Target: EXACTLY {max_cards} unique businesses...')
-        
-        # First, let's get all the business cards from Google Maps to ensure we have clean data
-        all_cards_data = []
-        
-        # First pass: get all card titles to help detect duplicates early
-        for idx in range(total_cards):
-            try:
-                card = cards[idx]
-                # Get just the business name to help with early duplicate detection
-                title_text = await card.evaluate('el => { const title = el.querySelector("div.fontHeadlineSmall"); return title ? title.textContent : ""; }')
-                all_cards_data.append({"idx": idx, "title": title_text.strip(), "card": card})
-            except Exception as e:
-                print(f"Error getting business title: {e}")
-                all_cards_data.append({"idx": idx, "title": "", "card": cards[idx]})
-        
-        # Process cards to extract businesses
-        processed_count = 0
-        unique_count = 0
-        
-        # Continue processing until we have exactly max_cards unique businesses
-        for card_data in all_cards_data:
+        # Incremental extraction loop
+        while len(data) < max_cards:
             if controller.stop_all_requested:
                 print('All stopped by user during extraction.')
                 break
                 
-            # If we've reached the exact number of unique businesses requested, we're done
+            # Get currently visible cards
+            visible_cards = await page.query_selector_all(results_selector)
+            current_count = len(visible_cards)
+            
+            if current_count == 0:
+                print("No cards found. Waiting for cards to appear...")
+                await asyncio.sleep(2)
+                continue
+                
+            print(f'Found {current_count} visible cards. Extracting new ones...')
+            
+            # Extract data from visible cards that haven't been processed yet
+            new_cards_processed = 0
+            
+            for idx, card in enumerate(visible_cards):
+                # Generate a unique card identifier based on position and text
+                try:
+                    card_id = await card.evaluate('el => el.outerHTML.length')  # Use HTML length as part of fingerprint
+                    title_text = await card.evaluate('el => { const title = el.querySelector("div.fontHeadlineSmall"); return title ? title.textContent : ""; }')
+                    card_fingerprint = f"{idx}_{card_id}_{title_text}"
+                    
+                    # Skip if we've already processed this card
+                    if card_fingerprint in processed_cards:
+                        continue
+                        
+                    # Mark as processed
+                    processed_cards.add(card_fingerprint)
+                    
+                    # Skip if title matches something we've already processed
+                    if title_text.lower() in processed_titles:
+                        print(f'Skipping duplicate title: {title_text}')
+                        continue
+                        
+                    # Process this card
+                    print(f'Processing new card: {title_text}')
+                    new_cards_processed += 1
+                    
+                    # Extraction logic - similar to the existing logic
+                    try:
+                        await card.click()
+                        await page.wait_for_selector('h1, .fontHeadlineLarge, .DUwDvf', timeout=8000)
+                        await asyncio.sleep(1)  # Reduced from 1.5 to 1 for speed
+                        
+                        # Get all text content for extraction
+                        all_text = await page.evaluate('''
+                            () => {
+                                const getText = (el) => {
+                                    if (!el) return '';
+                                    return Array.from(el.childNodes)
+                                        .map(node => {
+                                            if (node.nodeType === 3) return node.textContent;
+                                            if (node.nodeType === 1) {
+                                                const style = window.getComputedStyle(node);
+                                                if (style.display === 'none' || style.visibility === 'hidden') return '';
+                                                return getText(node);
+                                            }
+                                            return '';
+                                        })
+                                        .join(' ')
+                                        .replace(/\\s+/g, ' ')
+                                        .trim();
+                                };
+                                return getText(document.body);
+                            }
+                        ''')
+                        
+                        # Try Gemini extraction first
+                        gemini_data = await extract_with_gemini(all_text)
+                        
+                        if gemini_data:
+                            name = gemini_data.get('Business Name', '')
+                            business_type = gemini_data.get('Business Type', '')
+                            address = gemini_data.get('Address', '')
+                            phone = gemini_data.get('Phone Number', '')
+                            email = gemini_data.get('Email', '')
+                            website = gemini_data.get('Website', '')
+                            opening_time = gemini_data.get('Opening Time', '')
+                            closing_time = gemini_data.get('Closing Time', '')
+                            business_hours = gemini_data.get('Business Hours', '')
+                        else:
+                            # Use manual extraction as fallback
+                            # ... [rest of the extraction code remains unchanged]
+                            name = await safe_text(page, 'h1, .fontHeadlineLarge, .DUwDvf, [data-item-id="title"]')
+                            business_type = await safe_text(page, '.fontBodyMedium button[jsaction*="pane.rating.category"], .skqShb')
+                            address = await safe_text(page, '[data-item-id="address"], .rogA2c, .Io6YTe.fontBodyMedium, .LrzXr')
+                            phone = await safe_text(page, '[data-item-id="phone"], .Io6YTe.fontBodyMedium, .UsdlK')
+                            
+                            # Extract opening and closing times
+                            opening_time = ''
+                            closing_time = ''
+                            business_hours = ''
+                            
+                            # Try to extract the hours information
+                            hours_data = await page.evaluate('''
+                                () => {
+                                    try {
+                                        // Find the hours container with more comprehensive selectors
+                                        const hoursContainer = document.querySelector('[data-item-id="oh"], .y0skZc, .t39EBf, [aria-label*="hour"], [aria-label*="open"], .IDyq0e, [data-ved][jsaction][role="button"][data-url*="hour"], .OMl5r');
+                                        
+                                        if (hoursContainer) {
+                                            // First check if today's hours are shown
+                                            const todayHours = document.querySelector('.fontBodyMedium[aria-label*="open"], .fontBodyMedium[aria-label*="close"], .ZDu9vd, .y0skZc, .OMl5r');
+                                            
+                                            let openingTime = '';
+                                            let closingTime = '';
+                                            let workingHours = '';
+                                            
+                                            if (todayHours) {
+                                                const hoursText = todayHours.textContent.trim();
+                                                workingHours = hoursText;
+                                                
+                                                // Extract hours using regex
+                                                const hoursMatch = hoursText.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*[–-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/);
+                                                
+                                                if (hoursMatch) {
+                                                    openingTime = hoursMatch[1].trim();
+                                                    closingTime = hoursMatch[2].trim();
+                                                } else {
+                                                    // Try another regex pattern for "Opens at X"
+                                                    const opensMatch = hoursText.match(/Opens\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/i);
+                                                    if (opensMatch) {
+                                                        openingTime = opensMatch[1].trim();
+                                                    }
+                                                    
+                                                    // Try another pattern for "Closes at X"
+                                                    const closesMatch = hoursText.match(/Closes\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/i);
+                                                    if (closesMatch) {
+                                                        closingTime = closesMatch[1].trim();
+                                                    }
+                                                }
+                                                
+                                                // Check for special cases
+                                                if (hoursText.includes('24 hours') || hoursText.includes('Open 24 hours')) {
+                                                    openingTime = '12:00 AM';
+                                                    closingTime = '11:59 PM';
+                                                    workingHours = 'Open 24 hours';
+                                                } else if (hoursText.includes('Closed')) {
+                                                    workingHours = 'Closed';
+                                                }
+                                            }
+                                            
+                                            // Always return shouldClick: true to get the full weekly schedule
+                                            return {
+                                                opening: openingTime,
+                                                closing: closingTime,
+                                                workingHours: workingHours,
+                                                shouldClick: true // Always click to get full schedule
+                                            };
+                                        }
+                                        
+                                        // If no hours container found, still try to click for hours
+                                        return { opening: '', closing: '', workingHours: '', shouldClick: true };
+                                    } catch (e) {
+                                        console.error('Error in initial hours detection:', e);
+                                        return { opening: '', closing: '', workingHours: '', shouldClick: true };
+                                    }
+                                }
+                            ''')
+                            
+                            # Initialize business hours
+                            business_hours = ''
+                            
+                            # If we need to click the hours button to get more information
+                            if hours_data.get('shouldClick', False):
+                                try:
+                                    # Click on hours button if it exists
+                                    hours_button = await page.query_selector('[data-item-id="oh"], .y0skZc, .t39EBf, [aria-label*="hour"], [aria-label*="open"], .IDyq0e, [data-ved][jsaction][role="button"][data-url*="hour"]')
+                                    if hours_button:
+                                        await hours_button.click()
+                                        await asyncio.sleep(0.8)  # Reduced from 1 to 0.8 for speed
+                                        
+                                        # Extract hours from the expanded view
+                                        expanded_hours = await page.evaluate('''
+                                            () => {
+                                                try {
+                                                    // Find the hours container with more comprehensive selectors
+                                                    const daysContainer = document.querySelector('.dRgULb, [aria-label*="hour"] div[jsaction*="pane.openhours"], div[role="region"][aria-label*="hour"], .t39EBf, .MmmeYe');
+                                                    if (!daysContainer) return { opening: '', closing: '', workingHours: '' };
+                                                    
+                                                    // Get today's date info for finding current day
+                                                    const today = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+                                                    
+                                                    // More comprehensive selector for day rows
+                                                    const dayRows = Array.from(daysContainer.querySelectorAll('tr, [role="row"], .mWUmld, .y0skZc div, div[jsaction*="pane.openhours"] div, .t39EBf div, .MmmeYe div'));
+                                                    
+                                                    // Days of the week for standardizing output
+                                                    const daysOfWeek = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+                                                    
+                                                    // Build full working hours schedule with better formatting
+                                                    const fullSchedule = [];
+                                                    const formattedSchedule = {};
+                                                    let openingTime = '';
+                                                    let closingTime = '';
+                                                    let targetRow = null;
+                                                    
+                                                    // Process each day row
+                                                    for (const row of dayRows) {
+                                                        const rowText = row.textContent.trim();
+                                                        
+                                                        // Skip rows without day information
+                                                        if (!daysOfWeek.some(day => rowText.includes(day))) {
+                                                            continue;
+                                                        }
+                                                        
+                                                        // Determine which day this row represents
+                                                        let currentDay = '';
+                                                        for (const day of daysOfWeek) {
+                                                            if (rowText.includes(day)) {
+                                                                currentDay = day;
+                                                                break;
+                                                            }
+                                                        }
+                                                        
+                                                        if (!currentDay) continue;
+                                                        
+                                                        // Extract hours using various patterns
+                                                        let hours = '';
+                                                        
+                                                        // Pattern 1: Standard hours format (9:00 AM - 5:00 PM)
+                                                        const standardHoursMatch = rowText.match(new RegExp(`${currentDay}\\s*(.+)`));
+                                                        if (standardHoursMatch) {
+                                                            hours = standardHoursMatch[1].trim();
+                                                        }
+                                                        
+                                                        // Handle special cases like "Closed" or "Open 24 hours"
+                                                        if (rowText.includes('Closed')) {
+                                                            hours = 'Closed';
+                                                        } else if (rowText.includes('Open 24 hours')) {
+                                                            hours = 'Open 24 hours';
+                                                        } else if (rowText.includes('24 hours')) {
+                                                            hours = 'Open 24 hours';
+                                                        }
+                                                        
+                                                        // Extract opening/closing times if this is today
+                                                        if (rowText.includes(today)) {
+                                                            targetRow = row;
+                                                            const hoursMatch = rowText.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*[–-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/);
+                                                            if (hoursMatch) {
+                                                                openingTime = hoursMatch[1].trim();
+                                                                closingTime = hoursMatch[2].trim();
+                                                            } else if (hours === 'Open 24 hours') {
+                                                                openingTime = '12:00 AM';
+                                                                closingTime = '11:59 PM';
+                                                            }
+                                                        }
+                                                        
+                                                        // Store in formatted schedule
+                                                        formattedSchedule[currentDay] = hours;
+                                                        
+                                                        // Also add to full schedule array for backward compatibility
+                                                        fullSchedule.push(`${currentDay}: ${hours}`);
+                                                    }
+                                                    
+                                                    // If we didn't find today, use the first day as default
+                                                    if (!targetRow && Object.keys(formattedSchedule).length > 0) {
+                                                        const firstDay = Object.keys(formattedSchedule)[0];
+                                                        const firstDayHours = formattedSchedule[firstDay];
+                                                        
+                                                        if (firstDayHours !== 'Closed' && firstDayHours !== 'Open 24 hours') {
+                                                            const hoursMatch = firstDayHours.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*[–-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/);
+                                                            if (hoursMatch) {
+                                                                openingTime = hoursMatch[1].trim();
+                                                                closingTime = hoursMatch[2].trim();
+                                                            }
+                                                        } else if (firstDayHours === 'Open 24 hours') {
+                                                            openingTime = '12:00 AM';
+                                                            closingTime = '11:59 PM';
+                                                        }
+                                                    }
+                                                    
+                                                    // Format the weekly schedule in a consistent way
+                                                    const formattedWeeklySchedule = daysOfWeek
+                                                        .map(day => `${day}: ${formattedSchedule[day] || 'Hours not available'}`)
+                                                        .join('; ');
+                                                    
+                                                    return {
+                                                        opening: openingTime,
+                                                        closing: closingTime,
+                                                        workingHours: formattedWeeklySchedule || fullSchedule.join('; ')
+                                                    };
+                                                } catch (e) {
+                                                    console.error('Error extracting hours:', e);
+                                                    return { opening: '', closing: '', workingHours: '' };
+                                                }
+                                            }
+                                        ''')
+                                        
+                                        opening_time = expanded_hours.get('opening', '')
+                                        closing_time = expanded_hours.get('closing', '')
+                                        business_hours = expanded_hours.get('workingHours', '')
+                                except Exception as e:
+                                    print(f"Error extracting expanded hours: {e}")
+                            else:
+                                # Use the hours data we already got
+                                opening_time = hours_data.get('opening', '')
+                                closing_time = hours_data.get('closing', '')
+                                business_hours = hours_data.get('workingHours', '')
+                            
+                            if not phone:
+                                phone_matches = re.findall(r'(\+?\d[\d\s\-().]{8,}\d)', all_text)
+                                phone = phone_matches[0] if phone_matches else ''
+                            
+                            # Enhanced website extraction
+                            website = ''
+                            website_elements = await page.query_selector_all('a[data-item-id="authority"], a[aria-label*="Website"], .rogA2c a, .Io6YTe a')
+                            for element in website_elements:
+                                href = await element.get_attribute('href')
+                                if href and 'google.com' not in href:
+                                    website = href
+                                    break
+                            
+                            if not website:
+                                domain_match = re.search(r'([a-zA-Z0-9\-\.]+\.(com|net|org|biz|info|co|us|in|uk|ca|au|io|me|site|store|online|tech|ai|app))', all_text)
+                                if domain_match:
+                                    website = domain_match.group(0)
+                            
+                            # Enhanced email extraction
+                            email = ''
+                            email_link = await page.query_selector('a[href^="mailto:"]')
+                            if email_link:
+                                email = (await email_link.get_attribute('href')).replace('mailto:', '').strip()
+                            
+                            if not email:
+                                emails = RobustSocialExtractor.extract_emails_from_text(all_text)
+                                email = emails[0] if emails else ''
+
+                        # Clean all fields
+                        name = clean_field(name)
+                        business_type = clean_field(business_type)
+                        address = clean_field(address)
+                        phone = clean_field(phone)
+                        email = clean_field(email)
+                        website = clean_field(website)
+                        opening_time = clean_field(opening_time)
+                        closing_time = clean_field(closing_time)
+                        business_hours = clean_field(business_hours)
+                        
+                        # Standardize business hours format
+                        business_hours = standardize_business_hours(business_hours)
+                        
+                        # Skip if no business name (invalid business)
+                        if not name.strip():
+                            print(f'Skipping business with no name')
+                            continue
+                            
+                        # Check early if we have a duplicate name/address (improves performance)
+                        name_address_match = False
+                        for existing in data:
+                            if name.lower() == existing['Business Name'].lower() and (
+                                not address or not existing['Address'] or 
+                                address.lower() == existing['Address'].lower() or
+                                (address and existing['Address'] and address.split(',')[0].lower() == existing['Address'].split(',')[0].lower())
+                            ):
+                                print(f'Duplicate by name/address: {name}')
+                                name_address_match = True
+                                break
+                        
+                        if name_address_match:
+                            continue
+                            
+                        # Mark this title as processed
+                        if title_text:
+                            processed_titles.add(title_text.lower())
+                            
+                        # Generate business hash for duplicate detection
+                        business_hash = create_business_hash(name, address, phone)
+                        
+                        # Skip if it's a duplicate (hash already exists)
+                        if business_hash in unique_hashes:
+                            print(f'Duplicate: {name}')
+                            continue
+                        
+                        # Normalize website URL
+                        if website and not website.startswith('http'):
+                            website = normalize_url(website)
+                        
+                        # Get website domain for cache lookup
+                        website_domain = None
+                        if website:
+                            try:
+                                parsed_url = urlparse(website)
+                                website_domain = parsed_url.netloc.lower()
+                            except Exception as e:
+                                print(f"Error parsing website URL: {e}")
+                                website_domain = None
+                        
+                        # Initialize social media data
+                        social_media_data = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
+                        found_emails = [email] if email else []
+                        
+                        # Enhanced social media extraction from Google Maps page
+                        maps_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
+                        for platform, link in maps_social_data.items():
+                            if link:
+                                social_media_data[platform] = link
+                        
+                        # Enhanced website extraction with caching
+                        if website and is_valid_url(website):
+                            # Check if we've already processed this domain before
+                            if website_domain and website_domain in processed_website_domains:
+                                print(f'Using cached extraction for domain: {website_domain}')
+                                if website_domain in WEBSITE_EXTRACTION_CACHE:
+                                    cached_social, cached_emails = WEBSITE_EXTRACTION_CACHE[website_domain]
+                                    
+                                    # Merge with cached social data (cached takes precedence for non-empty values)
+                                    for platform, link in cached_social.items():
+                                        if link and not social_media_data.get(platform):
+                                            social_media_data[platform] = link
+                                    
+                                    # Add cached emails
+                                    found_emails.extend(cached_emails)
+                            else:
+                                print(f'Enhanced extraction from website: {website}')
+                                try:
+                                    website_social_data, website_emails = await enhanced_extract_from_website(website, context)
+                                    
+                                    # Mark domain as processed to avoid future redundant processing
+                                    if website_domain:
+                                        processed_website_domains.add(website_domain)
+                                    
+                                    # Merge social media data (website takes precedence)
+                                    for platform, link in website_social_data.items():
+                                        if link and not social_media_data.get(platform):
+                                            social_media_data[platform] = link
+                                    
+                                    # Add website emails
+                                    found_emails.extend(website_emails)
+                                except Exception as e:
+                                    print(f'Error in website extraction: {e}')
+                        
+                        # Use the best email found
+                        final_email = found_emails[0] if found_emails else ''
+                        
+                        # Create business data entry
+                        business_data = {
+                            'Business Name': name,
+                            'Business Type': business_type,
+                            'Address': address,
+                            'Phone Number': phone,
+                            'Email': final_email,
+                            'Website': website,
+                            'Opening Time': opening_time,
+                            'Closing Time': closing_time,
+                            'Business Hours': business_hours,
+                            'Facebook': social_media_data['Facebook'],
+                            'Instagram': social_media_data['Instagram'],
+                            'Twitter': social_media_data['Twitter'],
+                            'LinkedIn': social_media_data['LinkedIn'],
+                            'YouTube': social_media_data['YouTube'],
+                            'TikTok': social_media_data['TikTok'],
+                            'Yelp': social_media_data['Yelp'],
+                            'WhatsApp': social_media_data['WhatsApp'],
+                            'Pinterest': social_media_data['Pinterest'],
+                        }
+                        
+                        # Add unique hash to set
+                        unique_hashes.add(business_hash)
+                        
+                        # Add to data
+                        data.append(business_data)
+                        
+                        # Count social media platforms found
+                        social_count = sum(1 for platform, link in social_media_data.items() if link)
+                        print(f'UNIQUE #{len(data)}/{max_cards} | {name} | Email: {bool(final_email)} | Social: {social_count}/9')
+                        
+                        # Break the card processing loop if we've reached the target
+                        if len(data) >= max_cards:
+                            print(f'Reached target of {max_cards} unique businesses!')
+                            break
+                            
+                    except Exception as e:
+                        print(f'Error processing card: {e}')
+                        continue
+                except Exception as e:
+                    print(f'Error getting card info: {e}')
+                    continue
+            
+            # Check if we need to scroll more
             if len(data) >= max_cards:
-                print(f'Reached target of EXACTLY {max_cards} unique businesses!')
+                print(f'Target reached: {len(data)}/{max_cards} businesses')
                 break
                 
-            processed_count += 1
-            
-            # Calculate remaining cards and progress
-            remaining_cards = total_cards - processed_count
-            remaining_unique_needed = max_cards - len(data)
-            
-            # Check if we're unlikely to find enough businesses
-            if remaining_unique_needed > 0 and remaining_cards < remaining_unique_needed * 2:
-                print(f"Warning: May not find enough unique businesses. Need {remaining_unique_needed} more with only {remaining_cards} cards left.")
-            
-            idx = card_data["idx"]
-            card = card_data["card"]
-            title = card_data["title"]
-            
-            # Skip this business if its title matches a business we've already processed
-            if title.lower() in processed_titles:
-                print(f'Skipping duplicate title: {title}')
-                continue
+            if controller.stop_scrolling_requested:
+                print(f'Scrolling stopped by user. Extracted {len(data)} businesses so far.')
+                break
                 
-            # Mark this title as processed
-            if title:
-                processed_titles.add(title.lower())
-            
-            try:
-                print(f'Processing: {processed_count}/{total_cards} [Unique: {len(data)}/{max_cards}, Remaining: {max_cards - len(data)}]')
+            if new_cards_processed == 0:
+                no_new_cards_scrolls += 1
+                consecutive_same_count += 1
+                print(f'No new unique cards found in this batch. Scroll attempt {no_new_cards_scrolls}/{max_no_new_cards_scrolls}')
                 
-                await card.click()
-                await page.wait_for_selector('h1, .fontHeadlineLarge, .DUwDvf', timeout=8000)
-                await asyncio.sleep(1.5)  # Increased from 1 to 1.5
-                
-                # Enhanced text extraction for better social media detection
-                all_text = await page.evaluate('''
-                    () => {
-                        const getText = (el) => {
-                            if (!el) return '';
-                            return Array.from(el.childNodes)
-                                .map(node => {
-                                    if (node.nodeType === 3) return node.textContent;
-                                    if (node.nodeType === 1) {
-                                        const style = window.getComputedStyle(node);
-                                        if (style.display === 'none' || style.visibility === 'hidden') return '';
-                                        return getText(node);
-                                    }
-                                    return '';
-                                })
-                                .join(' ')
-                                .replace(/\\s+/g, ' ')
-                                .trim();
-                        };
-                        return getText(document.body);
-                    }
-                ''')
-                
-                # Try Gemini extraction first
-                gemini_data = await extract_with_gemini(all_text)
-                
-                if gemini_data:
-                    name = gemini_data.get('Business Name', '')
-                    business_type = gemini_data.get('Business Type', '')
-                    address = gemini_data.get('Address', '')
-                    phone = gemini_data.get('Phone Number', '')
-                    email = gemini_data.get('Email', '')
-                    website = gemini_data.get('Website', '')
-                else:
-                    # Enhanced manual extraction
-                    name = await safe_text(page, 'h1, .fontHeadlineLarge, .DUwDvf, [data-item-id="title"]')
-                    business_type = await safe_text(page, '.fontBodyMedium button[jsaction*="pane.rating.category"], .skqShb')
-                    address = await safe_text(page, '[data-item-id="address"], .rogA2c, .Io6YTe.fontBodyMedium, .LrzXr')
-                    phone = await safe_text(page, '[data-item-id="phone"], .Io6YTe.fontBodyMedium, .UsdlK')
-                    
-                    if not phone:
-                        phone_matches = re.findall(r'(\+?\d[\d\s\-().]{8,}\d)', all_text)
-                        phone = phone_matches[0] if phone_matches else ''
-                    
-                    # Enhanced website extraction
-                    website = ''
-                    website_elements = await page.query_selector_all('a[data-item-id="authority"], a[aria-label*="Website"], .rogA2c a, .Io6YTe a')
-                    for element in website_elements:
-                        href = await element.get_attribute('href')
-                        if href and 'google.com' not in href:
-                            website = href
-                            break
-                    
-                    if not website:
-                        domain_match = re.search(r'([a-zA-Z0-9\-\.]+\.(com|net|org|biz|info|co|us|in|uk|ca|au|io|me|site|store|online|tech|ai|app))', all_text)
-                        if domain_match:
-                            website = domain_match.group(0)
-                    
-                    # Enhanced email extraction
-                    email = ''
-                    email_link = await page.query_selector('a[href^="mailto:"]')
-                    if email_link:
-                        email = (await email_link.get_attribute('href')).replace('mailto:', '').strip()
-                    
-                    if not email:
-                        emails = RobustSocialExtractor.extract_emails_from_text(all_text)
-                        email = emails[0] if emails else ''
-
-                # Clean all fields
-                name = clean_field(name)
-                business_type = clean_field(business_type)
-                address = clean_field(address)
-                phone = clean_field(phone)
-                email = clean_field(email)
-                website = clean_field(website)
-                
-                # Skip if no business name (invalid business)
-                if not name.strip():
-                    print(f'Skipping business with no name')
-                    continue
-                    
-                # Check early if we have a duplicate name/address (improves performance)
-                name_address_match = False
-                for existing in data:
-                    if name.lower() == existing['Business Name'].lower() and (
-                        not address or not existing['Address'] or 
-                        address.lower() == existing['Address'].lower() or
-                        (address and existing['Address'] and address.split(',')[0].lower() == existing['Address'].split(',')[0].lower())
-                    ):
-                        print(f'Duplicate by name/address: {name}')
-                        name_address_match = True
-                        break
-                
-                if name_address_match:
-                    continue
-                    
-                # Generate business hash for duplicate detection
-                business_hash = create_business_hash(name, address, phone)
-                
-                # Skip if it's a duplicate (hash already exists)
-                if business_hash in unique_hashes:
-                    print(f'Duplicate: {name}')
-                    continue
-                
-                # Normalize website URL
-                if website and not website.startswith('http'):
-                    website = normalize_url(website)
-                
-                # Get website domain for cache lookup
-                website_domain = None
-                if website:
+                if consecutive_same_count >= max_consecutive_same_count:
+                    print(f'No new cards found after {consecutive_same_count} consecutive attempts. Trying aggressive scroll...')
+                    # Aggressive scroll to try to load more results
                     try:
-                        parsed_url = urlparse(website)
-                        website_domain = parsed_url.netloc.lower()
+                        for _ in range(5):
+                            await page.evaluate('''
+                                () => {
+                                    const mainContainer = document.querySelector('div[role="main"] div[aria-label][tabindex="0"]');
+                                    if (mainContainer) {
+                                        mainContainer.scrollBy(0, 3000);
+                                    }
+                                    window.scrollBy(0, 2000);
+                                }
+                            ''')
+                            await page.keyboard.press('End')
+                            await page.mouse.wheel(0, 3000)
+                            await asyncio.sleep(0.3)
+                        await asyncio.sleep(1.5)
                     except Exception as e:
-                        print(f"Error parsing website URL: {e}")
-                        website_domain = None
+                        print(f"Aggressive scroll failed: {e}")
                 
-                # Initialize social media data
-                social_media_data = {platform: '' for platform in RobustSocialExtractor.SOCIAL_PATTERNS.keys()}
-                found_emails = [email] if email else []
+                if no_new_cards_scrolls >= max_no_new_cards_scrolls:
+                    print(f'Maximum scroll attempts reached. Stopping with {len(data)} businesses.')
+                    break
+            else:
+                print(f'Found {new_cards_processed} new businesses in this batch')
+                no_new_cards_scrolls = 0
+                consecutive_same_count = 0
+            
+            # Scroll to get more cards
+            try:
+                # Scroll down to load more results
+                await page.evaluate('''
+                    (selector) => {
+                        const scrollable = document.querySelector(selector);
+                        if (scrollable) {
+                            scrollable.scrollBy(0, 1500);
+                        } else {
+                            window.scrollBy(0, 1500);
+                        }
+                    }
+                ''', scrollable_selector)
                 
-                # Enhanced social media extraction from Google Maps page
-                maps_social_data = RobustSocialExtractor.extract_social_from_text(all_text)
-                for platform, link in maps_social_data.items():
-                    if link:
-                        social_media_data[platform] = link
+                # Additional scrolling with key and mouse
+                await page.keyboard.press('PageDown')
+                await page.mouse.wheel(0, 1000)
                 
-                # Enhanced website extraction with caching
-                if website and is_valid_url(website):
-                    # Check if we've already processed this domain before
-                    if website_domain and website_domain in processed_website_domains:
-                        print(f'Using cached extraction for domain: {website_domain}')
-                        if website_domain in WEBSITE_EXTRACTION_CACHE:
-                            cached_social, cached_emails = WEBSITE_EXTRACTION_CACHE[website_domain]
-                            
-                            # Merge with cached social data (cached takes precedence for non-empty values)
-                            for platform, link in cached_social.items():
-                                if link and not social_media_data.get(platform):
-                                    social_media_data[platform] = link
-                            
-                            # Add cached emails
-                            found_emails.extend(cached_emails)
-                    else:
-                        print(f'Enhanced extraction from website: {website}')
-                        try:
-                            website_social_data, website_emails = await enhanced_extract_from_website(website, context)
-                            
-                            # Mark domain as processed to avoid future redundant processing
-                            if website_domain:
-                                processed_website_domains.add(website_domain)
-                            
-                            # Merge social media data (website takes precedence)
-                            for platform, link in website_social_data.items():
-                                if link and not social_media_data.get(platform):
-                                    social_media_data[platform] = link
-                            
-                            # Add website emails
-                            found_emails.extend(website_emails)
-                        except Exception as e:
-                            print(f'Error in website extraction: {e}')
-                
-                # Use the best email found
-                final_email = found_emails[0] if found_emails else ''
-                
-                # Create business data entry
-                business_data = {
-                    'Business Name': name,
-                    'Business Type': business_type,
-                    'Address': address,
-                    'Phone Number': phone,
-                    'Email': final_email,
-                    'Website': website,
-                    'Facebook': social_media_data['Facebook'],
-                    'Instagram': social_media_data['Instagram'],
-                    'Twitter': social_media_data['Twitter'],
-                    'LinkedIn': social_media_data['LinkedIn'],
-                    'YouTube': social_media_data['YouTube'],
-                    'TikTok': social_media_data['TikTok'],
-                    'Yelp': social_media_data['Yelp'],
-                    'WhatsApp': social_media_data['WhatsApp'],
-                    'Pinterest': social_media_data['Pinterest'],
-                }
-                
-                # Add unique hash to set
-                unique_hashes.add(business_hash)
-                
-                # Add to data
-                data.append(business_data)
-                
-                # Count social media platforms found
-                social_count = sum(1 for platform, link in social_media_data.items() if link)
-                print(f'UNIQUE #{len(data)}/{max_cards} | {name} | Email: {bool(final_email)} | Social: {social_count}/9')
+                # Short wait for new cards to load
+                await asyncio.sleep(1)
                 
             except Exception as e:
-                print(f'Error: {e}')
-                continue
+                print(f'Error scrolling: {e}')
+                # Try alternative scrolling
+                try:
+                    await page.evaluate('window.scrollBy(0, 1500)')
+                    await asyncio.sleep(1)
+                except:
+                    pass
 
-        # Check if we couldn't find enough businesses
-        if len(data) < max_cards:
-            print(f"Warning: Only found {len(data)} unique businesses out of the {max_cards} requested.")
-        else:
-            print(f"SUCCESS: Extracted EXACTLY {len(data)} unique businesses as requested!")
-
-        # Print cache statistics before closing
-        print(f"\nCache statistics:")
+        # Print statistics before closing
+        print(f"\nExtraction complete!")
+        print(f"Total unique businesses extracted: {len(data)}")
         print(f"Total domains in extraction cache: {len(WEBSITE_EXTRACTION_CACHE)}")
         print(f"Total processed website domains: {len(processed_website_domains)}")
         
@@ -1797,6 +1947,7 @@ def launch_ui():
 
     max_cards_var.trace('w', validate_max_cards)
     
+    
     # Features section
     features_frame = ttk.LabelFrame(main_frame, text='Enhanced Features', padding=15)
     features_frame.pack(fill=tk.X, pady=(0,15))
@@ -1886,7 +2037,7 @@ def export_to_excel(data, filename):
         # Reorder columns for better presentation
         column_order = [
             'Business Name', 'Business Type', 'Address', 'Phone Number', 
-            'Email', 'Website', 'Facebook', 'Instagram', 'Twitter', 
+            'Email', 'Website', 'Opening Time', 'Closing Time', 'Business Hours', 'Facebook', 'Instagram', 'Twitter', 
             'LinkedIn', 'YouTube', 'TikTok', 'Yelp', 'WhatsApp', 'Pinterest'
         ]
         
@@ -2041,7 +2192,6 @@ def export_to_excel(data, filename):
         print(f'4-6 platforms: {len(df[(df["Social_Count"] >= 4) & (df["Social_Count"] <= 6)])} ({len(df[(df["Social_Count"] >= 4) & (df["Social_Count"] <= 6)])/len(df):.1%})')
         print(f'7+ platforms: {len(df[df["Social_Count"] >= 7])} ({len(df[df["Social_Count"] >= 7])/len(df):.1%})')
         print(f'Average platforms per business: {df["Social_Count"].mean():.1f}')
-        
     except Exception as e:
         print(f'Error exporting to Excel: {e}')
 
