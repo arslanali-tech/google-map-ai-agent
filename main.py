@@ -2201,4 +2201,3 @@ if __name__ == '__main__':
     print("Supported platforms: Facebook, Instagram, Twitter, LinkedIn, YouTube, TikTok, Yelp, WhatsApp, Pinterest")
     print("=" * 80)
     launch_ui()
-   
