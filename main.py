@@ -1926,12 +1926,23 @@ def launch_ui():
 
     create_tooltip(max_cards_entry, 
                    f"Enter the EXACT number of businesses you want to extract (1-{MAX_BUSINESSES}).\n"
-                   f"The scraper will attempt to extract precisely this number of unique businesses.")
-
-    # Add a slider for easier selection
-    max_cards_slider = ttk.Scale(cards_frame, from_=1, to=MAX_BUSINESSES, 
-                                variable=max_cards_var, orient=tk.HORIZONTAL, length=200)
-    max_cards_slider.pack(side=tk.LEFT, padx=(10,0))
+                   f"The scraper will attempt to extract precisely this number of unique businesses.")    # Add a slider for easier selection with integer steps
+    style = ttk.Style()
+    style.configure("Custom.Horizontal.TScale", sliderthickness=25)  # Increase slider thickness
+    
+    max_cards_slider = ttk.Scale(cards_frame, from_=1, to=MAX_BUSINESSES,
+                                variable=max_cards_var, orient=tk.HORIZONTAL, length=300,  # Increased length
+                                style="Custom.Horizontal.TScale")
+    
+    # Force integer values
+    def on_slider_change(event):
+        current_value = max_cards_slider.get()
+        max_cards_var.set(round(current_value))  # Round to nearest integer
+    
+    max_cards_slider.bind("<Motion>", on_slider_change)  # Update while dragging
+    max_cards_slider.bind("<ButtonRelease-1>", on_slider_change)  # Update after release
+    
+    max_cards_slider.pack(side=tk.LEFT, padx=(10,0), pady=10)  # Added vertical padding
 
     def validate_max_cards(*args):
         try:
